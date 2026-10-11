@@ -229,6 +229,23 @@ class Cache:
         photo.path = path
         return photo
 
+    def get_many(self, paths: dict[Path, tuple[int, int]]) -> dict[str, Photo]:
+        """Read changed rows using one connection and already observed stamps."""
+        wanted = {self._key(path): (path, fingerprint) for path, fingerprint in paths.items()}
+        found = {}
+        if not wanted:
+            return found
+        with self._connect() as connection:
+            rows = connection.execute("SELECT path, size, mtime_ns, data FROM photos")
+            for key, size, mtime_ns, data in rows:
+                match = wanted.get(key)
+                if match is None or match[1] != (size, mtime_ns):
+                    continue
+                photo = photo_from_dict(json.loads(data))
+                photo.path = match[0]
+                found[str(photo.path)] = photo
+        return found
+
     def put(self, photo: Photo) -> None:
         self.put_many([photo])
 

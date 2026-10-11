@@ -14,7 +14,8 @@ from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from . import __version__
 from .api import DEFAULT_MODELS, list_models
-from .domain import is_gender_prefixed_filename
+from .domain import is_gender_prefixed_filename, select_through
+from .model_catalog import model_id, model_label, restore_model
 from .engine import Engine
 from .models import Photo
 from .storage import KeyStore, SettingsStore
@@ -31,11 +32,13 @@ class FrameTagApp(tk.Tk):
         self.key_store = key_store or KeyStore()
         self.events = queue.Queue()
         self.engine = engine_factory(lambda name, data: self.events.put((name, data)))
+        self._engine_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-control")
         self.photos: list[Photo] = []
         self.by_id: dict[str, Photo] = {}
         self.reference = ""
         self._busy = False
         self._loading = False
+        self._auto_pending = False
         self._loaded_folder = None
         self._closed = False
         self._tray = None
@@ -66,7 +69,8 @@ class FrameTagApp(tk.Tk):
             provider = "NVIDIA"
         self.folder = tk.StringVar(value=saved.get("folder", ""))
         self.provider = tk.StringVar(value=provider)
-        self.model = tk.StringVar(value=self._models.get(provider, self._defaults(provider)[0]))
+        self.model = tk.StringVar(value=restore_model(provider, self._models.get(provider, "")))
+        self.model_choice = tk.StringVar(value=model_label(provider, self.model.get()))
         self.api_key = tk.StringVar()
         self.recursive = tk.BooleanVar(value=bool(saved.get("recursive", False)))
         self.auto_watch = tk.BooleanVar(value=False)
@@ -74,6 +78,7 @@ class FrameTagApp(tk.Tk):
         self.show_completed = tk.BooleanVar(value=bool(saved.get("show_completed", False)))
         self.search = tk.StringVar()
         self.status = tk.StringVar(value="폴더와 API 키를 선택하세요. 설정은 다음 실행에도 유지됩니다.")
+        self.loading_text = tk.StringVar()
         self.count = tk.StringVar(value="0 / 0")
         self.preview_label = tk.StringVar(value="사진을 선택하면 미리보기가 표시됩니다.")
         self.zoom_label = tk.StringVar(value="맞춤")
@@ -88,7 +93,8 @@ class FrameTagApp(tk.Tk):
         self.search.trace_add("write", self._search_changed)
         self.api_key.trace_add("write", self._key_changed)
         self.folder.trace_add("write", self._folder_changed)
-        self.model.trace_add("write", lambda *args: self._schedule_save())
+        self.model.trace_add("write", self._model_changed)
+        self.model_choice.trace_add("write", self._model_choice_changed)
         self._active_provider = provider
         self._load_key(provider)
         self._setup_tray()
@@ -101,8 +107,45 @@ class FrameTagApp(tk.Tk):
         defaults = DEFAULT_MODELS.get(provider, [])
         if isinstance(defaults, str):
             return [defaults]
-        return list(defaults) or (["gpt-4.1-mini"] if provider == "OpenAI" else
-                                  ["nvidia/nemotron-nano-12b-v2-vl"])
+        return list(defaults)
+
+    def _model_changed(self, *args):
+        label = model_label(self.provider.get(), self.model.get())
+        if self.model_choice.get() != label:
+            self.model_choice.set(label)
+        self._schedule_save()
+
+    def _model_choice_changed(self, *args):
+        identifier = model_id(self.provider.get(), self.model_choice.get())
+        if self.model.get() != identifier:
+            self.model.set(identifier)
+
+    def _dispatch_engine(self, action, *args, done=None):
+        """Keep filesystem/engine locks off Tk's event thread, in FIFO order."""
+        if self._closed:
+            return
+        def run():
+            try:
+                if not self._closed:
+                    action(*args)
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+            finally:
+                if done:
+                    self.events.put((done, None))
+        self._engine_pool.submit(run)
+
+    def _update_loading_indicator(self):
+        active = self._loading or self._auto_pending
+        self.loading_text.set("로딩 중 · 사진 목록과 저장된 결과를 불러오고 있습니다." if self._loading else
+                              "처리 중 · 자동 감시 설정을 적용하고 있습니다." if self._auto_pending else "")
+        if active and str(self.progress["mode"]) != "indeterminate":
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(40)
+        elif not active and str(self.progress["mode"]) == "indeterminate":
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress["value"] = 100 * sum(bool(p.analysis) for p in self.photos) / len(self.photos) if self.photos else 0
 
     def _apply_style(self):
         self.option_add("*Font", ("Segoe UI", 10))
@@ -143,10 +186,11 @@ class FrameTagApp(tk.Tk):
                                            state="readonly", width=10)
         self.provider_combo.grid(row=1, column=2, pady=(8, 0), padx=(0, 8))
         self.provider_combo.bind("<<ComboboxSelected>>", self._provider_changed)
-        self.model_combo = ttk.Combobox(header, textvariable=self.model, width=32,
-                                       values=self._defaults(self.provider.get()))
+        self.model_combo = ttk.Combobox(header, textvariable=self.model_choice, width=38,
+                                       values=[model_label(self.provider.get(), identifier)
+                                               for identifier in self._defaults(self.provider.get())])
         self.model_combo.grid(row=1, column=3, pady=(8, 0), padx=(0, 5), sticky="ew")
-        self.models_button = ttk.Button(header, text="모델 목록", command=self._fetch_models)
+        self.models_button = ttk.Button(header, text="사용 가능한 모델 확인", command=self._fetch_models)
         self.models_button.grid(row=1, column=4, pady=(8, 0))
         ttk.Button(header, text="설정 저장", command=lambda: self._save_settings(explicit=True)).grid(
             row=1, column=5, padx=(5, 0), pady=(8, 0))
@@ -240,13 +284,12 @@ class FrameTagApp(tk.Tk):
         ttk.Label(preview, textvariable=self.preview_label, wraplength=500).pack(fill="x", pady=(7, 0))
         self.progress = ttk.Progressbar(self, maximum=100, mode="determinate")
         self.progress.pack(fill="x", padx=10, pady=(7, 4))
+        ttk.Label(self, textvariable=self.loading_text, padding=(10, 0)).pack(fill="x")
         ttk.Label(self, textvariable=self.status, padding=(10, 4)).pack(fill="x")
 
     def _startup(self, auto, background):
-        if self.folder.get().strip() and Path(self.folder.get()).is_dir():
+        if self.folder.get().strip():
             self._load_folder(resume_auto=auto)
-        elif self.folder.get().strip():
-            self.status.set("저장한 폴더를 찾을 수 없습니다. 폴더를 다시 선택하세요.")
         if background:
             self._hide()
 
@@ -266,11 +309,11 @@ class FrameTagApp(tk.Tk):
     def _folder_changed(self, *args):
         if self._loaded_folder is not None:
             try:
-                matches = Path(self.folder.get().strip()).resolve() == self._loaded_folder
+                matches = Path(os.path.abspath(self.folder.get().strip())) == self._loaded_folder
             except (OSError, ValueError):
                 matches = False
             if not matches and self.auto_watch.get():
-                self.engine.set_auto(False)
+                self._dispatch_engine(self.engine.set_auto, False)
                 self.auto_watch.set(False)
         self._schedule_save()
 
@@ -355,21 +398,22 @@ class FrameTagApp(tk.Tk):
         self._save_key()
         self._models[self._active_provider] = self.model.get().strip()
         self._active_provider = self.provider.get()
-        self.model.set(self._models.get(self._active_provider, self._defaults(self._active_provider)[0]))
-        self.model_combo.configure(values=self._defaults(self._active_provider))
+        self.model.set(restore_model(self._active_provider, self._models.get(self._active_provider, "")))
+        self.model_combo.configure(values=[model_label(self._active_provider, identifier)
+                                          for identifier in self._defaults(self._active_provider)])
         self._load_key(self._active_provider)
         self._schedule_save()
         self._configure_engine()
 
     def _configure_engine(self):
-        self.engine.configure(self.provider.get(), self.model.get().strip(), self.api_key.get().strip())
+        self._dispatch_engine(self.engine.configure, self.provider.get(), self.model.get().strip(), self.api_key.get().strip())
 
     def _fetch_models(self):
         provider, key = self.provider.get(), self.api_key.get().strip()
         if not key:
             messagebox.showinfo("모델 목록", "선택한 공급자의 API 키를 먼저 입력하세요.", parent=self)
             return
-        self.models_button.configure(state="disabled")
+        self.models_button.configure(state="disabled", text="모델 확인 중…")
         self.status.set("계정에서 사용할 수 있는 API 모델 목록을 가져오는 중입니다.")
         def fetch():
             try:
@@ -396,40 +440,41 @@ class FrameTagApp(tk.Tk):
             self.status.set("분석을 중지한 뒤 폴더를 불러오세요.")
             return
         path = Path(self.folder.get().strip()).expanduser()
-        if not self.folder.get().strip() or not path.is_dir():
+        if not self.folder.get().strip():
             messagebox.showerror("사진 폴더", "사진이 있는 폴더를 선택하세요.", parent=self)
             return
         if resume_auto is None:
             resume_auto = self.auto_watch.get()
-        self.engine.set_auto(False)
         self.auto_watch.set(False)
         self._loading = True
         self.reference = ""
         self._update_buttons()
         self.status.set("사진 목록과 저장된 결과를 불러오는 중입니다.")
         recursive = self.recursive.get()
-        self._configure_engine()
+        config = (self.provider.get(), self.model.get().strip(), self.api_key.get().strip())
         def load():
             try:
+                self.engine.set_auto(False)
+                self.engine.configure(*config)
                 if self.engine.load_folder(path, recursive):
-                    self.events.put(("loaded", (path, resume_auto)))
+                    self.events.put(("loaded", (path.resolve(), resume_auto)))
                 else:
                     self.events.put(("load_error", "폴더를 불러오지 못했습니다. 오류를 확인한 뒤 다시 시도하세요."))
             except Exception as exc:
                 self.events.put(("load_error", str(exc)))
-        threading.Thread(target=load, daemon=True, name="folder-load").start()
+        self._dispatch_engine(load)
 
     def _analyze(self):
         if not self._ready():
             return
         self._save_settings()
         self._configure_engine()
-        self.engine.start_analysis()
+        self._dispatch_engine(self.engine.start_analysis)
 
     def _ready(self):
         if self._loading:
             return False
-        if not self.folder.get().strip() or not Path(self.folder.get()).is_dir():
+        if not self.folder.get().strip():
             messagebox.showinfo("사진 폴더", "폴더를 먼저 선택하세요.", parent=self)
             return False
         if not self._folder_matches():
@@ -442,7 +487,7 @@ class FrameTagApp(tk.Tk):
 
     def _folder_matches(self):
         try:
-            return self._loaded_folder is not None and Path(self.folder.get().strip()).resolve() == self._loaded_folder
+            return self._loaded_folder is not None and Path(os.path.abspath(self.folder.get().strip())) == self._loaded_folder
         except (OSError, ValueError):
             return False
 
@@ -452,12 +497,14 @@ class FrameTagApp(tk.Tk):
             self.auto_watch.set(False)
             return
         self._configure_engine()
-        self.engine.set_auto(enabled)
+        self._auto_pending = True
+        self._update_buttons()
+        self._dispatch_engine(self.engine.set_auto, enabled, done="auto_done")
         self._save_settings()
 
     def _stop_analysis(self):
         self.auto_watch.set(False)
-        self.engine.stop_analysis()
+        self._dispatch_engine(self.engine.stop_analysis)
         self._save_settings()
 
     def _search_changed(self, *args):
@@ -541,7 +588,8 @@ class FrameTagApp(tk.Tk):
             count += f" · 완료 {hidden_completed:,}장 숨김"
         self.count.set(count)
         completed = sum(bool(p.analysis) for p in self.photos)
-        self.progress["value"] = 100 * completed / len(self.photos) if self.photos else 0
+        if not self._loading and not self._auto_pending:
+            self.progress["value"] = 100 * completed / len(self.photos) if self.photos else 0
 
     def _selection_changed(self, event=None):
         iid = self.tree.focus()
@@ -683,7 +731,7 @@ class FrameTagApp(tk.Tk):
             new_value = text.get()
             editor.destroy()
             if commit:
-                self.engine.update_photo(iid, field, new_value)
+                self._dispatch_engine(self.engine.update_photo, iid, field, new_value)
             self._render_rows()
         editor.bind("<Return>", lambda event: finish(True))
         editor.bind("<Escape>", lambda event: finish(False))
@@ -720,13 +768,14 @@ class FrameTagApp(tk.Tk):
         if len(paths) < 2 or not self.reference:
             messagebox.showinfo("기준 통일", "사진을 두 장 이상 선택하고 기준 사진을 우클릭해 지정하세요.", parent=self)
             return
-        self.engine.unify_selected(paths, self.reference)
+        self._dispatch_engine(self.engine.unify_selected, paths, self.reference)
 
     def _select_through(self):
         current = self.tree.focus()
         if not current:
             return
-        paths = self.engine.select_through(current)
+        selected_photo = self.by_id.get(current)
+        paths = [str(photo.path) for photo in select_through(self.photos, selected_photo)] if selected_photo else []
         visible = set(self.tree.get_children(""))
         selected = [path for path in paths if path in visible]
         self.tree.selection_set(selected)
@@ -760,16 +809,18 @@ class FrameTagApp(tk.Tk):
             except Exception as exc:
                 self.events.put(("error", f"파일명 변경 오류: {exc}"))
             finally:
-                self.events.put(("operation_done", None))
-        threading.Thread(target=run, daemon=True, name="file-operation").start()
+                self.events.put(("operation_done", self.engine.is_busy()))
+        self._dispatch_engine(run)
 
     def _update_buttons(self):
-        unavailable = self._busy or self._loading
+        unavailable = self._busy or self._loading or self._auto_pending
         for widget in (self.load_button, self.browse_button, self.apply_button, self.undo_button,
                        self.folder_entry, self.recursive_check):
             widget.configure(state="disabled" if unavailable else "normal")
         self.analyze_button.configure(state="disabled" if unavailable else "normal")
         self.stop_button.configure(state="normal" if self._busy else "disabled")
+        self.auto_check.configure(state="disabled" if self._loading or self._auto_pending else "normal")
+        self._update_loading_indicator()
 
     def _poll(self):
         if self._closed:
@@ -788,7 +839,10 @@ class FrameTagApp(tk.Tk):
                 self._busy = bool(data)
                 self._update_buttons()
             elif name == "operation_done":
-                self._busy = self.engine.is_busy()
+                self._busy = bool(data)
+                self._update_buttons()
+            elif name == "auto_done":
+                self._auto_pending = False
                 self._update_buttons()
             elif name == "auto":
                 self.auto_watch.set(bool(data))
@@ -805,7 +859,7 @@ class FrameTagApp(tk.Tk):
                 self._update_buttons()
                 if resume_auto and self._ready():
                     self._configure_engine()
-                    self.engine.set_auto(True)
+                    self._dispatch_engine(self.engine.set_auto, True)
                     self.auto_watch.set(True)
                 self._save_settings()
             elif name == "load_error":
@@ -814,12 +868,15 @@ class FrameTagApp(tk.Tk):
                 self.status.set(data)
             elif name == "models":
                 provider, models = data
-                self.models_button.configure(state="normal")
+                self.models_button.configure(state="normal", text="사용 가능한 모델 확인")
                 if provider == self.provider.get():
-                    self.model_combo.configure(values=models)
-                    self.status.set(f"API 모델 {len(models)}개를 불러왔습니다. 이미지 입력 지원 모델을 선택하세요.")
+                    self.model_combo.configure(values=[model_label(provider, identifier) for identifier in models])
+                    if models and self.model.get() not in models:
+                        self.model.set(models[0])
+                    self.status.set(f"계정 목록에서 사진 분석 후보 {len(models)}개를 확인했습니다." if models else
+                                    "계정 목록에 추천 사진 모델이 없습니다. NVIDIA 계정의 모델 권한을 확인하세요.")
             elif name == "models_error":
-                self.models_button.configure(state="normal")
+                self.models_button.configure(state="normal", text="사용 가능한 모델 확인")
                 self.status.set(data)
                 messagebox.showerror("모델 목록", data, parent=self)
             elif name == "preview":
@@ -890,6 +947,8 @@ class FrameTagApp(tk.Tk):
             return
         self._save_settings()
         self._closed = True
+        self._engine_pool.shutdown(wait=False, cancel_futures=True)
+        self.progress.stop()
         for after_id in (self._poll_id, self._save_id, self._search_id, self._preview_id, self._key_save_id):
             if after_id:
                 try:

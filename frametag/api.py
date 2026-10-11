@@ -18,12 +18,9 @@ import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .domain import normalize_analysis
+from .model_catalog import DEFAULT_MODELS, RETIRED_NVIDIA_MODELS, photo_models
 
 
-DEFAULT_MODELS = {
-    "NVIDIA": ["nvidia/nemotron-nano-12b-v2-vl"],
-    "OpenAI": ["gpt-4.1-mini"],
-}
 ENDPOINTS = {
     "NVIDIA": "https://integrate.api.nvidia.com/v1",
     "OpenAI": "https://api.openai.com/v1",
@@ -234,6 +231,9 @@ def _request(
                 raise APIError("API 결제·크레딧 오류 (402). 계정 한도를 확인하세요.", fatal=True)
             if status == 404:
                 raise APIError("모델을 찾을 수 없습니다 (404). 모델 ID와 사용 권한을 확인하세요.", fatal=True)
+            if status == 410:
+                raise APIError("선택한 모델의 API 제공이 종료되었거나 해당 경로가 폐쇄되었습니다 (410). "
+                               "모델 목록을 갱신하고 다른 사진 분석 모델을 선택하세요.", fatal=True)
             if status not in RETRY_STATUSES:
                 raise APIError(f"API 요청 오류 ({status}). 모델의 이미지 지원 여부를 확인하세요.")
             if attempt == MAX_ATTEMPTS - 1:
@@ -271,6 +271,9 @@ class Analyzer:
             raise APIError("선택한 공급자의 API 키를 입력하세요.", fatal=True)
         if not self.model:
             raise APIError("이미지 분석 모델 ID를 입력하세요.", fatal=True)
+        if self.provider == "NVIDIA" and self.model in RETIRED_NVIDIA_MODELS:
+            raise APIError("기존 Nemotron Nano 12B V2 VL 모델에서 제공 종료 오류가 확인되었습니다. "
+                           "Qwen 3.5 등 다른 사진 분석 모델을 선택하세요.", fatal=True)
         image_url = _image_url(Path(path), cancel)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": PROMPT},
@@ -285,7 +288,12 @@ class Analyzer:
                 payload["max_completion_tokens"] = 1200
                 payload["response_format"] = {"type": "json_object"}
             else:
-                payload["max_tokens"] = 1200
+                payload["max_tokens"] = 1600
+                payload["temperature"] = 0.1
+                if self.model in {"qwen/qwen3.5-122b-a10b", "qwen/qwen3.5-397b-a17b"}:
+                    payload["chat_template_kwargs"] = {"enable_thinking": False}
+                elif self.model == "mistralai/mistral-small-4-119b-2603":
+                    payload["reasoning_effort"] = None
             response = _request("POST", ENDPOINTS[self.provider] + "/chat/completions",
                                 self._key, cancel, payload, self._transport)
             content = _message_text(response)
@@ -332,4 +340,4 @@ def list_models(
     except (ValueError, KeyError, TypeError):
         raise APIError("API 서버의 모델 목록 형식을 읽을 수 없습니다.") from None
     _check_cancel(cancel)
-    return result
+    return photo_models(provider, result)

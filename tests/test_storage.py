@@ -58,6 +58,19 @@ class StorageTests(unittest.TestCase):
             loaded = list(executor.map(lambda photo: cache.get(photo.path), photos))
         self.assertEqual(loaded, photos)
 
+    def test_bulk_cache_read_uses_one_connection_and_rejects_changed_fingerprints(self):
+        photos = [self.photo(f"{index}.jpg") for index in range(20)]
+        photos[0].manual, photos[0].revision = True, 5
+        cache = Cache(self.root)
+        cache.put_many(photos)
+        paths = {photo.path: (photo.size, photo.mtime_ns) for photo in photos}
+        paths[photos[-1].path] = (photos[-1].size + 1, photos[-1].mtime_ns)
+        with patch.object(cache, "_connect", wraps=cache._connect) as connect:
+            loaded = cache.get_many(paths)
+        self.assertEqual(connect.call_count, 1)
+        self.assertEqual(loaded, {str(photo.path): photo for photo in photos[:-1]})
+        self.assertEqual(cache.get_many({}), {})
+
     def test_settings_are_persistent_and_recursively_exclude_secrets(self):
         store = SettingsStore(self.root / "config")
         store.save({"folder": "D:/사진", "provider": "OpenAI", "api_key": "test-only-key",

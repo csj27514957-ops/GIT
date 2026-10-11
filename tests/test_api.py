@@ -13,6 +13,7 @@ import httpx
 from PIL import Image
 
 from frametag.api import Analyzer, APIError, Cancelled, _retry_delay, list_models
+from frametag.model_catalog import DEFAULT_MODELS, model_id, model_label, restore_model
 
 
 GOOD = {
@@ -147,7 +148,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(len(calls), 4)
 
     def test_auth_payment_and_model_errors_stop_immediately(self):
-        for status in (401, 402, 403, 404):
+        for status in (401, 402, 403, 404, 410):
             with self.subTest(status=status):
                 calls = []
 
@@ -264,13 +265,54 @@ class APITests(unittest.TestCase):
     def test_model_discovery_sorted_unique(self):
         def handler(request):
             self.assertEqual(request.method, "GET")
-            self.assertEqual(str(request.url), "https://integrate.api.nvidia.com/v1/models")
+            self.assertEqual(str(request.url), "https://api.openai.com/v1/models")
             return httpx.Response(200, json={"data": [
                 {"id": "z"}, {"id": "a"}, {"id": "a"}, {"id": None},
             ]})
 
-        self.assertEqual(list_models("nvidia", "test-placeholder",
+        self.assertEqual(list_models("OpenAI", "test-placeholder",
                                      transport=httpx.MockTransport(handler)), ["a", "z"])
+
+    def test_nvidia_discovery_only_offers_supported_photo_candidates(self):
+        available = ["nvidia/nemotron-nano-12b-v2-vl", "meta/llama-3.3-70b-instruct",
+                     "qwen/qwen3.5-397b-a17b", "nvidia/nemotron-3-nano-omni-30b-a3b",
+                     "qwen/qwen3.5-122b-a10b", "qwen/qwen3.5-122b-a10b"]
+        def handler(request):
+            self.assertEqual(str(request.url), "https://integrate.api.nvidia.com/v1/models")
+            return httpx.Response(200, json={"data": [{"id": name} for name in available]})
+        self.assertEqual(list_models("NVIDIA", "test-placeholder", transport=httpx.MockTransport(handler)),
+                         ["qwen/qwen3.5-122b-a10b", "qwen/qwen3.5-397b-a17b",
+                          "nvidia/nemotron-3-nano-omni-30b-a3b"])
+
+    def test_each_recommended_nvidia_model_uses_its_vision_request_options(self):
+        for identifier in DEFAULT_MODELS["NVIDIA"]:
+            with self.subTest(model=identifier):
+                def handler(request):
+                    payload = json.loads(request.content)
+                    self.assertEqual(payload["model"], identifier)
+                    self.assertEqual(payload["messages"][1]["content"][1]["type"], "image_url")
+                    self.assertEqual(payload["max_tokens"], 1600)
+                    if identifier.startswith("qwen/"):
+                        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+                    else:
+                        self.assertIn("reasoning_effort", payload)
+                        self.assertIsNone(payload["reasoning_effort"])
+                    return reply()
+                result = Analyzer("NVIDIA", identifier, "test-placeholder", transport=httpx.MockTransport(handler)).analyze(
+                    self.photo, threading.Event())
+                self.assertEqual(result["gender"], "남성")
+
+    def test_retired_model_fails_before_upload_and_saved_selection_migrates(self):
+        retired = "nvidia/nemotron-nano-12b-v2-vl"
+        analyzer = Analyzer("NVIDIA", retired, "test-placeholder", transport=httpx.MockTransport(
+            lambda _: self.fail("Retired model must never upload a photo")))
+        with self.assertRaises(APIError) as caught:
+            analyzer.analyze(self.photo, threading.Event())
+        self.assertTrue(caught.exception.fatal)
+        self.assertEqual(restore_model("NVIDIA", retired), DEFAULT_MODELS["NVIDIA"][0])
+        for identifier in DEFAULT_MODELS["NVIDIA"]:
+            self.assertEqual(model_id("NVIDIA", model_label("NVIDIA", identifier)), identifier)
+        self.assertEqual(restore_model("OpenAI", "custom-vision-id"), "custom-vision-id")
 
 
 if __name__ == "__main__":

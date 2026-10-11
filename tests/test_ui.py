@@ -13,6 +13,7 @@ from PIL import Image
 
 from frametag.engine import Engine
 from frametag.models import Photo
+from frametag.model_catalog import DEFAULT_MODELS, model_label
 from frametag.storage import Cache, SettingsStore
 from frametag.ui import FrameTagApp
 
@@ -150,6 +151,105 @@ class UITests(unittest.TestCase):
         self.assertEqual(json.loads(settings_text)["folder"], str(self.folder))
         self.assertNotIn("mock-nvidia-key-not-valid", settings_text)
         self.assertNotIn("mock-openai-key-not-valid", settings_text)
+        self.assertFalse(self.errors)
+
+    def test_retired_model_migrates_and_friendly_choices_save_actual_api_id(self):
+        self.app._save_settings()
+        self.app._exit()
+        saved = self.settings.load()
+        saved["models"]["NVIDIA"] = "nvidia/nemotron-nano-12b-v2-vl"
+        self.settings.save(saved)
+        self.app = self._new_app()
+        default = DEFAULT_MODELS["NVIDIA"][0]
+        self.assertEqual(self.app.model.get(), default)
+        self.assertEqual(self.app.model_choice.get(), model_label("NVIDIA", default))
+        self.wait(lambda: len(self.app.photos) == 3 and not self.app._loading)
+        available = DEFAULT_MODELS["NVIDIA"][1:]
+        with patch("frametag.ui.list_models", return_value=available):
+            self.app._fetch_models()
+            self.wait(lambda: self.app.model.get() == available[0])
+        self.assertEqual(list(self.app.model_combo["values"]), [model_label("NVIDIA", name) for name in available])
+        self.app.model_choice.set(model_label("NVIDIA", available[1]))
+        self.app._save_settings()
+        self.assertEqual(self.settings.load()["models"]["NVIDIA"], available[1])
+        self.assertFalse(self.errors)
+
+    def _hold_engine_lock(self):
+        entered, release = threading.Event(), threading.Event()
+        def hold():
+            with self.app.engine._lock:
+                entered.set()
+                release.wait(2)
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(1))
+        timer = threading.Timer(1.2, release.set)
+        timer.start()
+        self.addCleanup(release.set)
+        self.addCleanup(timer.cancel)
+        return release, thread
+
+    def test_folder_loading_animates_and_gui_stays_responsive_during_engine_lock(self):
+        release, thread = self._hold_engine_lock()
+        started = time.monotonic()
+        self.app._load_folder()
+        self.assertLess(time.monotonic() - started, .25)
+        self.assertTrue(self.app._loading)
+        self.assertIn("로딩 중", self.app.loading_text.get())
+        self.assertEqual(str(self.app.progress["mode"]), "indeterminate")
+        initial_progress = float(self.app.progress["value"])
+        heartbeat = []
+        self.app.after(30, lambda: heartbeat.append(True))
+        self.wait(lambda: bool(heartbeat), timeout=.5)
+        self.wait(lambda: float(self.app.progress["value"]) > initial_progress, timeout=.5)
+        self.assertFalse(release.is_set())
+        release.set()
+        thread.join(1)
+        self.wait(lambda: not self.app._loading and not self.app._busy)
+        self.assertEqual(self.app.loading_text.get(), "")
+        self.assertEqual(str(self.app.progress["mode"]), "determinate")
+
+    def test_auto_watch_toggle_returns_immediately_and_shows_pending_state(self):
+        release, thread = self._hold_engine_lock()
+        self.app.auto_watch.set(True)
+        started = time.monotonic()
+        self.app._toggle_auto()
+        self.assertLess(time.monotonic() - started, .25)
+        self.assertTrue(self.app._auto_pending)
+        self.assertIn("처리 중", self.app.loading_text.get())
+        initial_progress = float(self.app.progress["value"])
+        heartbeat = []
+        self.app.after(30, lambda: heartbeat.append(True))
+        self.wait(lambda: bool(heartbeat), timeout=.5)
+        self.wait(lambda: float(self.app.progress["value"]) > initial_progress, timeout=.5)
+        self.assertFalse(release.is_set())
+        release.set()
+        thread.join(1)
+        self.wait(lambda: not self.app._auto_pending and self.app.auto_watch.get())
+        self.assertEqual(self.app.loading_text.get(), "")
+        self.assertFalse(self.errors)
+
+    def test_queued_edit_is_applied_before_immediate_rename_action(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        timer = threading.Timer(1.2, release.set)
+        self.addCleanup(timer.cancel)
+        timer.start()
+        def pending():
+            entered.set()
+            release.wait(2)
+        self.app._dispatch_engine(pending)
+        self.wait(entered.is_set)
+        first = str(self.app.photos[0].path)
+        original = Path(first).read_bytes()
+        self.app._dispatch_engine(self.app.engine.update_photo, first, "proposed_name", "수정확인.jpg")
+        self.app.tree.selection_set(first)
+        self.app._apply()
+        release.set()
+        target = self.folder / "수정확인.jpg"
+        self.wait(lambda: target.exists() and not self.app._busy)
+        self.assertFalse(Path(first).exists())
+        self.assertEqual(target.read_bytes(), original)
         self.assertFalse(self.errors)
 
     def test_changed_folder_entry_pauses_watch_and_refuses_wrong_folder_actions(self):

@@ -244,12 +244,19 @@ class Engine:
         present: set[str] = set()
         changed, manifest_changed = False, False
         recognized: list[Photo] = []
+        observed = {}
         for path in paths:
             path = path.resolve()
             try:
                 fingerprint = self._fingerprint(path)
             except (FileNotFoundError, PermissionError, OSError):
                 continue
+            observed[path] = fingerprint
+        changed_paths = {path: fingerprint for path, fingerprint in observed.items()
+                         if str(path) not in self._photos
+                         or (self._photos[str(path)].size, self._photos[str(path)].mtime_ns) != fingerprint}
+        cached = self._cache.get_many(changed_paths)
+        for path, fingerprint in observed.items():
             name, identifier = self._key(path), str(path)
             present.add(name)
             previous_fingerprint, count = self._stable.get(name, (fingerprint, 0))
@@ -258,7 +265,7 @@ class Engine:
             if photo is None or (photo.size, photo.mtime_ns) != fingerprint:
                 # A matching cache owns the user's edits and undo state. Only
                 # infer completion from a filename when no valid record exists.
-                photo = self._cache.get(path)
+                photo = cached.get(identifier)
                 if photo is None:
                     analysis = parse_frametag_filename(path.name)
                     photo = Photo(path, *fingerprint)

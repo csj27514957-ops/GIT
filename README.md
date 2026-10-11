@@ -1,4 +1,4 @@
-# FrameTag v2.0.2
+# FrameTag v2.0.3
 
 사진을 NVIDIA 또는 OpenAI의 이미지 분석 API로 분석하고, 성별 표현·의류·정물을 조합한 이름으로 바꾸는 Windows 프로그램입니다.
 
@@ -10,12 +10,29 @@
 
 1. Windows 10/11에 [Python 3.12 이상](https://www.python.org/downloads/windows/)을 설치합니다. 설치 구성의 Tcl/Tk 항목을 포함해야 합니다.
 2. 소스 ZIP을 완전히 풀고 `run_windows.bat`을 더블클릭합니다. 첫 실행에 가상 환경을 만들고 필요한 패키지를 설치하므로 인터넷이 필요합니다.
-3. 공급자, 이미지 분석을 지원하는 모델, API 키를 지정합니다. NVIDIA 기본 모델은 `nvidia/nemotron-nano-12b-v2-vl`, OpenAI 기본 모델은 `gpt-4.1-mini`입니다. 계정에서 실제 사용 가능한 모델 ID를 입력하거나 모델 목록을 불러올 수 있습니다.
+3. 공급자, 사진 분석 모델, API 키를 지정합니다. NVIDIA 기본 모델은 **Qwen 3.5 122B A10B**, OpenAI 기본 모델은 `gpt-4.1-mini`입니다. **사용 가능한 모델 확인**을 누르면 계정 목록에 있는 사진 분석 후보만 표시됩니다.
 4. 사진 폴더를 선택하고 설정을 저장합니다. API 키 저장에 실패했다는 메시지가 나오면 키가 저장되지 않은 상태이므로 원인을 확인합니다.
 5. 기존 사진은 목록을 불러와 **남은 사진 분석 → 결과 확인/수정 → 현재 사진까지 선택 → 선택 파일명 적용** 순서로 처리합니다.
 6. 새 사진을 곧바로 이름 변경하려면 **새 사진 자동 분석·이름 변경**을 체크합니다.
 
 API 키는 [NVIDIA](https://build.nvidia.com/settings/api-keys) 또는 [OpenAI](https://platform.openai.com/api-keys)에서 발급합니다. ChatGPT 구독과 OpenAI API 결제는 별개입니다. 모델 사용 권한·요금·한도는 각 계정에 따릅니다. 기존 문서의 `GPT-5.6 Luna/Terra/Sol` 같은 Codex 모델 이름을 실제 공개 API 모델 ID로 사용하지 않습니다.
+
+## NVIDIA 사진 분석 모델
+
+| 표시 이름 | 실제 API 모델 ID | 선택 기준 |
+| --- | --- | --- |
+| Qwen 3.5 122B A10B · 기본 추천 | `qwen/qwen3.5-122b-a10b` | 기본 사진 분석 후보 |
+| Qwen 3.5 397B A17B · 큰 모델 | `qwen/qwen3.5-397b-a17b` | 큰 모델로 결과를 비교할 때 |
+| Mistral Small 4 119B · 대안 | `mistralai/mistral-small-4-119b-2603` | Qwen 계열의 대안 |
+| Nemotron 3 Nano Omni 30B · 계정 목록 확인 | `nvidia/nemotron-3-nano-omni-30b-a3b` | 정확히 이 ID가 계정 목록에 있을 때만 표시 |
+
+2026-10-11에 [NVIDIA LangChain 통합의 모델 등록 정보](https://github.com/langchain-ai/langchain-nvidia/blob/main/libs/ai-endpoints/langchain_nvidia_ai_endpoints/_statics.py)에서 앞의 세 모델이 이미지 입력 모델로 분류되는 것과 요청 옵션을 확인했습니다. Omni의 이미지 지원은 [NVIDIA 개발 문서](https://github.com/NVIDIA-NeMo/Nemotron/blob/main/docs/nemotron/omni3/inference.md)를 기준으로 합니다. 이 환경에서는 NVIDIA 직접 조회가 네트워크 프록시에 막혀 실제 호스팅 가용성을 확인하지 못했습니다. 실행 PC에서 **사용 가능한 모델 확인**을 눌러 계정 목록을 조회하세요. 목록에 나타나도 서비스 중단·계정 권한 등으로 실제 요청이 실패할 수 있습니다.
+
+표시 이름 대신 실제 모델 ID를 설정에 저장합니다. 기존 `nvidia/nemotron-nano-12b-v2-vl` 설정은 보고된 HTTP 410 오류 때문에 새 기본값으로 교체합니다. 410은 해당 API의 제공 종료/경로 폐쇄로 안내하고 한 장에서 바로 중지하므로 나머지 사진이 연속 오류가 되지 않습니다. 무료 여부·한도는 계정과 NVIDIA의 현재 정책에 따르며 프로그램에서 보장하지 않습니다.
+
+## 목록 로딩과 화면 반응
+
+폴더 불러오기와 자동 감시 설정은 백그라운드에서 처리합니다. 캐시도 사진마다 DB를 다시 여는 대신 한 번에 읽습니다. 작업 중에는 **로딩 중** 또는 **처리 중** 문구와 움직이는 진행 표시가 나타나며, 설정이 끝나기 전에는 중복 작업 버튼을 잠시 비활성화합니다. 사진 수와 저장 장치 속도에 따라 기다리는 시간은 달라지지만 화면에서 파일 조회의 잠금을 기다리지 않습니다.
 
 ## 자동 감시와 백그라운드 실행
 
