@@ -12,7 +12,8 @@ from unittest.mock import patch
 from PIL import Image
 
 from frametag.engine import Engine
-from frametag.storage import SettingsStore
+from frametag.models import Photo
+from frametag.storage import Cache, SettingsStore
 from frametag.ui import FrameTagApp
 
 
@@ -188,12 +189,44 @@ class UITests(unittest.TestCase):
         self.app.show_completed.set(False)
         self.app._completed_filter_changed()
         self.app.engine.update_photo(renamed, "objects", "우산")
-        self.wait(lambda: renamed in self.app.tree.get_children())
+        self.wait(lambda: self.app.by_id[renamed].manual and not self.app.by_id[renamed].confirmed)
+        self.assertNotIn(renamed, self.app.tree.get_children())
         self.assertFalse(self.app.by_id[renamed].confirmed)
         self.app._undo()
         self.wait(lambda: first in self.app.tree.get_children() and not self.app._busy)
         self.assertTrue(Path(first).exists())
         self.assertFalse(Path(renamed).exists())
+        self.assertFalse(self.errors)
+
+    def test_gender_prefixed_photos_are_hidden_even_with_old_pending_cache(self):
+        self.app._save_settings()
+        self.app._exit()
+        names = (
+            "여성_교복_곰인형.jpg", "여성_꽃무늬원피스_대걸레 (1).jpg",
+            "여성_검정스트라이프긴팔_베이지바지.jpg",
+            "남성+여성_회색반팔_파랑청바지.jpg", "남성_군복_가방_4.jpg",
+        )
+        for name in names:
+            path = self.folder / name
+            Image.new("RGB", (40, 60), "blue").save(path)
+            Cache(self.folder).put(Photo.from_path(path))
+        self.app = self._new_app()
+        self.wait(lambda: len(self.app.photos) == 8 and not self.app._loading)
+        self.assertEqual(len(self.app.tree.get_children()), 3)
+        self.assertIn("완료 5장 숨김", self.app.count.get())
+        self.app._analyze()
+        self.wait(lambda: len(FakeAnalyzer.calls) == 3 and not self.app._busy)
+        self.assertEqual(set(FakeAnalyzer.calls), {"photo1.jpg", "photo2.jpg", "photo3.jpg"})
+        self.app.show_completed.set(True)
+        self.app._completed_filter_changed()
+        self.assertEqual(len(self.app.tree.get_children()), 8)
+        for name in names:
+            identifier = str(self.folder / name)
+            self.assertEqual(self.app.tree.item(identifier, "values")[0], "이름 기준 제외")
+            self.assertTrue(Path(identifier).exists())
+        self.app.show_completed.set(False)
+        self.app._completed_filter_changed()
+        self.assertEqual(len(self.app.tree.get_children()), 3)
         self.assertFalse(self.errors)
 
     def test_arrival_during_slow_manual_analysis_is_visible_then_renamed_once(self):

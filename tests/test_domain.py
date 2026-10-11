@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from frametag.domain import (
-    filename_from_analysis, list_images, natural_key, normalize_analysis,
+    filename_from_analysis, is_gender_prefixed_filename, list_images, natural_key, normalize_analysis,
     parse_frametag_filename, sanitize_filename, select_through, unify_runs,
 )
 from frametag.models import Photo
@@ -72,6 +72,39 @@ class FilenameTests(unittest.TestCase):
         self.assertEqual(Path(result).suffix, ".png")
         self.assertNotIn("/", result)
         self.assertEqual(sanitize_filename(result, ".png"), result)
+
+
+class GenderPrefixExclusionTests(unittest.TestCase):
+    def test_all_gender_prefixes_ignore_clothing_objects_and_collision_style(self):
+        names = (
+            "여성_교복_검정자켓.jpg", "여성_교복_곰인형.jpg",
+            "여성_교복_아크릴판.jpg", "여성_교복_유리판_6.jpg",
+            "여성_꽃무늬원피스_대걸레 (1).jpg",
+            "여성_검정스트라이프긴팔_베이지바지.jpg",
+            "남성+여성_회색반팔_파랑청바지.jpg", "여성+남성_교복_2.PNG",
+            "남성_군복.jpg", "남성_군복_가방_4.jpg", "여성_휴가사진.png",
+            "남성사진.JPG", "여성.jpg",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(is_gender_prefixed_filename(name))
+
+    def test_labels_inside_original_names_or_proposed_names_do_not_exclude(self):
+        for name in ("IMG_남성.jpg", "사진_여성_교복.jpg", "original.png", "1 (2).jpg", ""):
+            with self.subTest(name=name):
+                self.assertFalse(is_gender_prefixed_filename(name))
+        original = photo(1)
+        original.proposed_name = "남성_군복.jpg"
+        self.assertEqual(select_through([original], original), [original])
+
+    def test_prefix_exclusion_splits_unification_runs_and_selection(self):
+        photos = [photo(1), photo(2), photo(3, objects=["가방(손)"])]
+        photos[1].path = Path("/photos/남성+여성_군복.jpg")
+        original_analysis = [dict(item.analysis) for item in photos]
+        self.assertEqual(unify_runs(photos), [])
+        self.assertEqual([item.analysis for item in photos], original_analysis)
+        self.assertEqual(select_through(photos, photos[2]), [photos[0], photos[2]])
+        self.assertEqual(select_through(photos, photos[1]), [])
 
 
 class ExistingFrameTagNameTests(unittest.TestCase):

@@ -123,12 +123,158 @@ class EngineTests(unittest.TestCase):
         engine.start_analysis()
         self.idle(engine)
         self.assertEqual({call[0] for call in self.api.calls},
-                         {original.name, arbitrary.name})
+                         {original.name})
         photos = {photo.path.name: photo for photo in engine.get_photos()}
         self.assertTrue(photos[tagged.name].confirmed)
         self.assertFalse(photos[original.name].confirmed)
         self.assertFalse(photos[arbitrary.name].confirmed)
+        self.assertFalse(engine._needs_analysis(photos[arbitrary.name]))
+        self.assertEqual(engine._known[arbitrary.name]["state"], "processed")
         self.assertTrue(tagged.exists())
+
+    def test_all_user_gender_prefixes_skip_analysis_without_changing_files(self):
+        names = [
+            "여성_교복_검정자켓.jpg", "여성_교복_검정자켓_2.jpg",
+            "여성_교복_곰인형.jpg", "여성_교복_아크릴판.jpg",
+            "여성_교복_유리판_6.jpg", "여성_교복_책_3.jpg",
+            "여성_교복_페트병.jpg", "여성_꽃무늬원피스_대걸레 (1).jpg",
+            "여성_검정스트라이프긴팔_베이지긴바지.jpg",
+            "남성+여성_회색반팔_파랑청바지.jpg", "남성_군복.jpg",
+            "남성_군복_가방_2.jpg", "여성+남성_직접정한의상.jpg",
+            "여성사진.jpg", "남성.jpg", "여성.png",
+        ]
+        paths = [self.photo(name) for name in names]
+        before = {path.name: path.read_bytes() for path in paths}
+        original = self.photo("IMG_20261011.jpg")
+        engine = self.engine()
+        engine.start_analysis()
+        self.idle(engine)
+        engine.set_auto(True)
+        wait_until(lambda: all(engine._stable[name][1] >= 3 for name in names))
+        self.assertEqual([call[0] for call in self.api.calls], [original.name])
+        photos = {photo.path.name: photo for photo in engine.get_photos()}
+        self.assertTrue(all(not engine._needs_analysis(photos[name]) for name in names))
+        self.assertTrue(all(engine._known[name]["state"] == "processed" for name in names))
+        self.assertEqual({path.name: path.read_bytes() for path in paths}, before)
+        self.assertFalse((self.root / "frametag_history_v2.json").exists())
+
+    def test_gender_prefix_overrides_manifest_states_and_preserves_cached_metadata(self):
+        names = ["여성_교복_곰인형.jpg", "남성+여성_직접정한의상.jpg",
+                 "여성_검정스트라이프긴팔_베이지긴바지.jpg", "남성_군복_가방_2.jpg"]
+        originals = []
+        cache = Cache(self.root)
+        for index, name in enumerate(names):
+            path = self.photo(name)
+            photo = Photo.from_path(path)
+            if index == 1:
+                photo.status, photo.error, photo.model = "오류", "이전 API 오류", "이전 모델"
+            elif index == 2:
+                photo.analysis = {"gender": "불명", "clothing": ["직접정한옷"], "objects": ["우산"]}
+                photo.status, photo.proposed_name, photo.model = "분석 완료", "불명_직접정한옷_우산.jpg", "이전 모델"
+            elif index == 3:
+                photo.manual, photo.revision, photo.status = True, 4, "수동 수정"
+                photo.analysis = {"gender": "남성", "clothing": ["군복"], "objects": ["가방"]}
+                photo.proposed_name = "직접변경예정.jpg"
+            cache.put(photo)
+            originals.append(photo)
+        states = ["pending", "error", "baseline", "pending"]
+        (self.root / ".frametag_watch_v2.json").write_text(json.dumps({
+            "version": 2, "recursive": False, "entries": {
+                photo.path.name: {"state": state, "size": photo.size,
+                                  "mtime_ns": photo.mtime_ns, "present": True}
+                for photo, state in zip(originals, states)}}), encoding="utf-8")
+        engine = self.engine()
+        engine.start_analysis()
+        self.idle(engine)
+        engine.set_auto(True)
+        engine.configure("OpenAI", "changed-model", "changed-placeholder")
+        wait_until(lambda: all(engine._stable[name][1] >= 3 for name in names))
+        self.assertEqual(self.api.calls, [])
+        photos = {photo.path.name: photo for photo in engine.get_photos()}
+        for original in originals:
+            with self.subTest(name=original.path.name):
+                self.assertEqual(photos[original.path.name], original)
+                self.assertEqual(cache.get(original.path), original)
+                self.assertEqual(engine._known[original.path.name]["state"], "processed")
+        record = json.loads((self.root / ".frametag_watch_v2.json").read_text())
+        self.assertTrue(all(record["entries"][name]["state"] == "processed" for name in names))
+        self.assertFalse((self.root / "frametag_history_v2.json").exists())
+
+    def test_new_gender_prefixes_are_skipped_while_new_original_is_renamed_once(self):
+        engine = self.engine()
+        engine.set_auto(True)
+        names = ["여성_교복_유리판_4.jpg", "남성+여성_회색반팔_파랑청바지.jpg",
+                 "남성_군복_가방_2.jpg"]
+        paths = [self.photo(name) for name in names]
+        before = {path.name: path.read_bytes() for path in paths}
+        original = self.photo("new_original.jpg", color="blue")
+        contents = original.read_bytes()
+        wait_until(lambda: len(self.api.calls) == 1 and not engine.is_busy()
+                   and not original.exists() and len(engine.get_photos()) == 4)
+        wait_until(lambda: all(engine._stable[name][1] >= 3 for name in names))
+        self.assertEqual([call[0] for call in self.api.calls], [original.name])
+        self.assertEqual({path.name: path.read_bytes() for path in paths}, before)
+        self.assertTrue(all(engine._known[name]["state"] == "processed" for name in names))
+        self.assertIn(contents, [photo.path.read_bytes() for photo in engine.get_photos()])
+        history = json.loads((self.root / "frametag_history_v2.json").read_text())
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["entries"][0]["source"], original.name)
+
+    def test_direct_process_does_not_analyze_or_rename_gender_prefixed_photo(self):
+        path = self.photo("여성_교복_곰인형.jpg")
+        contents = path.read_bytes()
+        engine = self.engine()
+        engine._process(str(path), automatic=False)
+        engine._process(str(path), automatic=True)
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(path.read_bytes(), contents)
+        self.assertFalse((self.root / "frametag_history_v2.json").exists())
+
+    def test_gender_prefix_cached_api_proposal_requires_manual_edit_before_apply(self):
+        path = self.photo("여성_교복_곰인형.jpg")
+        contents = path.read_bytes()
+        cached = Photo.from_path(path)
+        cached.analysis = {"gender": "불명", "clothing": [], "objects": []}
+        cached.proposed_name, cached.status = "불명.jpg", "분석 완료"
+        Cache(self.root).put(cached)
+        engine = self.engine()
+        engine.apply_selected([str(path)])
+        self.assertEqual(path.read_bytes(), contents)
+        self.assertFalse((self.root / cached.proposed_name).exists())
+        self.assertFalse((self.root / "frametag_history_v2.json").exists())
+        self.assertEqual(engine.get_photos()[0], cached)
+        engine.update_photo(str(path), "proposed_name", "직접확인.jpg")
+        engine.apply_selected([str(path)])
+        self.assertFalse(path.exists())
+        self.assertEqual((self.root / "직접확인.jpg").read_bytes(), contents)
+        self.assertEqual(self.api.calls, [])
+
+    def test_gender_prefix_preserves_explicit_manual_apply_undo_and_selection(self):
+        path = self.photo("남성_군복_가방_2.jpg")
+        original = self.photo("original.png")
+        contents = path.read_bytes()
+        engine = self.engine()
+        engine.update_photo(str(path), "proposed_name", "직접수정.jpg")
+        self.assertEqual(engine.select_through(str(path)), [])
+        self.assertEqual(engine.select_through(str(original)), [str(original)])
+        engine.apply_selected([str(path)])
+        target = self.root / "직접수정.jpg"
+        self.assertEqual(target.read_bytes(), contents)
+        self.assertFalse(path.exists())
+        engine.undo()
+        self.assertEqual(path.read_bytes(), contents)
+        restored = {photo.path.name: photo for photo in engine.get_photos()}[path.name]
+        self.assertTrue(restored.manual)
+        self.assertFalse(restored.confirmed)
+        self.assertEqual(restored.proposed_name, target.name)
+        self.assertFalse(engine._needs_analysis(restored))
+        engine.shutdown()
+        restarted = self.engine()
+        restarted.set_auto(True)
+        wait_until(lambda: restarted._stable[path.name][1] >= 3)
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual({photo.path.name: photo for photo in restarted.get_photos()}[path.name], restored)
+        self.assertEqual(restarted._known[path.name]["state"], "processed")
 
     def test_user_numbered_tagged_names_skip_analysis_and_keep_existing_baseline(self):
         names = ["여성_흰색반팔_검정긴바지_3.jpg",
@@ -359,11 +505,11 @@ class EngineTests(unittest.TestCase):
         record = json.loads((self.root / ".frametag_watch_v2.json").read_text())
         self.assertEqual(record["entries"][TAGGED_NAME]["state"], "processed")
 
-    def test_valid_unconfirmed_cache_takes_precedence_over_tagged_filename(self):
+    def test_valid_unconfirmed_cache_is_preserved_but_gender_prefix_skips_analysis(self):
         path = self.photo(TAGGED_NAME)
         cached = Photo.from_path(path)
         # A valid awaiting-analysis record can come from an earlier version or
-        # an undo. The filename heuristic must not replace that explicit state.
+        # an undo. Keep that metadata, while the gender prefix excludes analysis.
         Cache(self.root).put(cached)
         engine = self.engine()
         self.assertFalse(engine.get_photos()[0].confirmed)
@@ -371,8 +517,11 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.get_photos()[0].status, "대기")
         engine.start_analysis()
         self.idle(engine)
-        self.assertEqual([call[0] for call in self.api.calls], [TAGGED_NAME])
+        self.assertEqual(self.api.calls, [])
         self.assertFalse(engine.get_photos()[0].confirmed)
+        self.assertEqual(engine.get_photos()[0], cached)
+        self.assertEqual(Cache(self.root).get(path), cached)
+        self.assertEqual(engine._known[TAGGED_NAME]["state"], "processed")
 
     def test_manual_edit_of_recognized_photo_survives_reload_and_undo(self):
         path = self.photo(TAGGED_NAME)

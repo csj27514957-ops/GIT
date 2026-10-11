@@ -39,6 +39,15 @@ def list_images(root: Path, recursive: bool = False) -> list[Path]:
                                        str(p.relative_to(root)).casefold()))
 
 
+def is_gender_prefixed_filename(filename: str) -> bool:
+    """Exclude every basename starting with the user's gender labels.
+
+    This includes mixed labels such as 남성+여성 and arbitrary clothing or
+    object text. It is an eligibility rule, independent of saved review state.
+    """
+    return isinstance(filename, str) and filename.startswith(("남성", "여성"))
+
+
 def _token(value: Any) -> str:
     return re.sub(r"[\s_-]+", "", str(value or "").strip().casefold())
 
@@ -297,6 +306,7 @@ def parse_frametag_filename(filename: str) -> dict | None:
 
 def _eligible(photo: Photo) -> bool:
     return (photo.analysis is not None and not photo.manual and not photo.confirmed
+            and not is_gender_prefixed_filename(photo.path.name)
             and photo.status not in ("대기", "오류", "분석 중", "분석중", "분석 대기"))
 
 
@@ -349,10 +359,11 @@ def unify_runs(photos: list[Photo]) -> list[Photo]:
 
 
 def select_through(photos: list[Photo], current: Photo) -> list[Photo]:
-    """Select unconfirmed rows from the start through the current object."""
-    if current.confirmed:
+    """Select eligible unconfirmed rows through the current object."""
+    if current.confirmed or is_gender_prefixed_filename(current.path.name):
         return []
     index = next((index for index, photo in enumerate(photos) if photo is current), None)
     if index is None:
         return []
-    return [photo for photo in photos[:index + 1] if not photo.confirmed]
+    return [photo for photo in photos[:index + 1]
+            if not photo.confirmed and not is_gender_prefixed_filename(photo.path.name)]

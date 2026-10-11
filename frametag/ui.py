@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from . import __version__
 from .api import DEFAULT_MODELS, list_models
+from .domain import is_gender_prefixed_filename
 from .engine import Engine
 from .models import Photo
 from .storage import KeyStore, SettingsStore
@@ -471,7 +472,9 @@ class FrameTagApp(tk.Tk):
     @staticmethod
     def _row_values(photo):
         analysis = photo.analysis or {}
-        return (photo.status, photo.path.name, analysis.get("gender", "-"),
+        status = ("이름 기준 제외" if is_gender_prefixed_filename(photo.path.name)
+                  and not photo.confirmed and not photo.manual else photo.status)
+        return (status, photo.path.name, analysis.get("gender", "-"),
                 ", ".join(analysis.get("clothing", [])) or "-",
                 ", ".join(analysis.get("objects", [])) or "-", photo.proposed_name or "-")
 
@@ -488,7 +491,7 @@ class FrameTagApp(tk.Tk):
         hidden_completed = 0
         self.by_id = {str(p.path): p for p in self.photos}
         for photo in self.photos:
-            if photo.confirmed and not self.show_completed.get():
+            if (photo.confirmed or is_gender_prefixed_filename(photo.path.name)) and not self.show_completed.get():
                 hidden_completed += 1
                 continue
             values = self._row_values(photo)

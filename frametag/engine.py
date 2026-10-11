@@ -17,7 +17,7 @@ from typing import Any, Callable
 from PIL import Image
 
 from .api import APIError, Analyzer, Cancelled
-from .domain import (filename_from_analysis, list_images, natural_key,
+from .domain import (filename_from_analysis, is_gender_prefixed_filename, list_images, natural_key,
                      normalize_analysis, parse_frametag_filename,
                      sanitize_filename, select_through, unify_runs)
 from .models import Photo
@@ -61,7 +61,8 @@ class Engine:
 
     def _ordered(self) -> list[Photo]:
         return sorted(self._photos.values(), key=lambda p: (
-            not p.confirmed, natural_key(str(p.path.parent)), natural_key(p.path.name)))
+            not (p.confirmed or is_gender_prefixed_filename(p.path.name)),
+            natural_key(str(p.path.parent)), natural_key(p.path.name)))
 
     def get_photos(self) -> list[Photo]:
         with self._lock:
@@ -229,7 +230,8 @@ class Engine:
 
     @staticmethod
     def _needs_analysis(photo: Photo) -> bool:
-        return not photo.confirmed and not photo.manual and (
+        return (not photo.confirmed and not photo.manual
+                and not is_gender_prefixed_filename(photo.path.name)) and (
             not photo.analysis or not photo.proposed_name
             or (bool(photo.error) and photo.status != "파일명 오류"))
 
@@ -269,13 +271,14 @@ class Engine:
                 self._photos[identifier] = photo
                 changed = True
             previous = self._known.get(name)
+            excluded = is_gender_prefixed_filename(path.name)
             if (previous is None or self._record_fingerprint(previous) != fingerprint
                     or not previous.get("present", True)
-                    or ((photo.confirmed or photo.manual)
+                    or ((photo.confirmed or photo.manual or excluded)
                         and previous.get("state") != "processed")):
                 added_scope_baseline = baseline_subfolders and previous is None and "/" in name
                 state = "baseline" if first_baseline or added_scope_baseline else "pending"
-                if photo.confirmed or photo.manual:
+                if photo.confirmed or photo.manual or excluded:
                     state = "processed"
                 self._known[name] = self._record(photo, state)
                 manifest_changed = True
@@ -304,7 +307,8 @@ class Engine:
         for photo in self._ordered():
             name = self._key(photo.path)
             record = self._known.get(name, {})
-            if record.get("state") != "pending" or photo.confirmed or photo.manual:
+            if (record.get("state") != "pending" or photo.confirmed or photo.manual
+                    or is_gender_prefixed_filename(photo.path.name)):
                 continue
             fingerprint, count = self._stable.get(name, ((-1, -1), 0))
             if count < self._stable_scans or fingerprint[0] <= 0:
@@ -336,6 +340,8 @@ class Engine:
             photo = self._photos.get(identifier)
             if photo is None or self._cancel.is_set():
                 return "cancelled"
+            if is_gender_prefixed_filename(photo.path.name):
+                return "excluded"
             snapshot = copy.deepcopy(photo)
             config, cancel = self._config, self._cancel
             cache = self._cache
@@ -621,6 +627,8 @@ class Engine:
                 else:
                     photos = [self._photos[p] for p in dict.fromkeys(str(Path(p).resolve()) for p in paths)
                               if p in self._photos and not self._photos[p].confirmed
+                              and (not is_gender_prefixed_filename(self._photos[p].path.name)
+                                   or self._photos[p].manual)
                               and self._photos[p].proposed_name]
                     pairs = apply_names(self._root, photos, self._cache)
                     self._remap(pairs)
