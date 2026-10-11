@@ -12,7 +12,7 @@ from PIL import Image
 from frametag.api import APIError, Cancelled
 from frametag.engine import Engine
 from frametag.models import Photo
-from frametag.rename import _move_no_clobber
+from frametag.rename import RenameError, _move_no_clobber
 from frametag.storage import Cache
 
 
@@ -1129,6 +1129,36 @@ class EngineTests(unittest.TestCase):
         engine.apply_selected([str(engine.get_photos()[0].path)])
         self.assertTrue(engine.get_photos()[0].confirmed)
 
+
+    def test_auto_pauses_while_an_interrupted_rename_awaits_recovery(self):
+        engine = self.engine()
+        engine.set_auto(True)
+
+        def stuck(root, photos, cache):
+            (Path(root) / ".frametag_pending_v2.json").write_text("{}", encoding="utf-8")
+            raise RenameError("원래 사진을 안전하게 찾지 못했습니다.")
+
+        with patch("frametag.engine.apply_names", side_effect=stuck):
+            self.photo("a.png")
+            self.photo("b.png", color="blue")
+            wait_until(lambda: ("auto", False) in self.events)
+            self.idle(engine)
+            time.sleep(0.3)
+        self.assertEqual(len(self.api.calls), 1)
+        self.assertEqual(sorted(photo.status for photo in engine.get_photos()), ["대기", "파일명 오류"])
+        self.assertEqual(sorted(path.name for path in self.root.glob("*.png")), ["a.png", "b.png"])
+
+    def test_auto_pauses_after_three_consecutive_rename_failures(self):
+        engine = self.engine()
+        engine.set_auto(True)
+        with patch("frametag.engine.apply_names", side_effect=PermissionError("locked")):
+            for index in range(5):
+                self.photo(f"{index}.png", color=(index * 40, 0, 0))
+            wait_until(lambda: ("auto", False) in self.events)
+            self.idle(engine)
+            time.sleep(0.3)
+        self.assertEqual(len(self.api.calls), 3)
+        self.assertEqual(len(list(self.root.glob("*.png"))), 5)
 
 if __name__ == "__main__":
     unittest.main()

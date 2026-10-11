@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -88,15 +89,71 @@ def _fingerprint(path: Path) -> dict[str, int]:
     return {"size": info.st_size, "mtime_ns": info.st_mtime_ns, "dev": info.st_dev, "ino": info.st_ino}
 
 
-def _matches(path: Path, entry: dict[str, Any]) -> bool:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
     try:
-        return _fingerprint(path) == {key: entry[key] for key in ("size", "mtime_ns", "dev", "ino")}
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise RenameError(f"사진 내용을 확인할 수 없습니다: {path.name}. 파일 사용 여부와 접근 권한을 확인해 주세요.") from exc
+    return digest.hexdigest()
+
+
+def _same_size_and_time(path: Path, entry: dict[str, Any]) -> bool:
+    try:
+        current = _fingerprint(path)
+    except (OSError, RenameError):
+        return False
+    return all(current[key] == entry[key] for key in ("size", "mtime_ns"))
+
+
+def _matches(path: Path, entry: dict[str, Any]) -> bool:
+    """Is this the photo the entry recorded?
+
+    The file ID settles it on NTFS. On FAT32/exFAT Windows derives that ID from
+    the directory slot, so each rename changes it; there the recorded content
+    hash decides. Size and modification time must agree in both cases.
+    """
+    try:
+        current = _fingerprint(path)
+        if any(current[key] != entry[key] for key in ("size", "mtime_ns")):
+            return False
+        if all(current[key] == entry[key] for key in ("dev", "ino")):
+            return True
+        digest = entry.get("sha256")
+        return bool(digest) and _sha256(path) == digest
     except (OSError, RenameError):
         return False
 
 
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def recovery_pending(root: Path) -> bool:
+    """True while an interrupted rename still waits for recovery in this folder."""
+    return os.path.lexists(Path(root) / _PENDING)
+
+
 def _exists(path: Path) -> bool:
     return os.path.lexists(path)
+
+
+def _move_windows(source: Path, target: Path, entry: dict[str, Any]) -> None:
+    try:
+        # Unlike POSIX rename, Windows os.rename fails if destination exists.
+        # exFAT/FAT32 drives have no hard links, so this is their only safe move.
+        os.rename(source, target)
+    except FileExistsError as exc:
+        raise RenameError(f"같은 이름의 파일이 생겨 변경을 중단했습니다: {target.name}") from exc
+    except OSError as exc:
+        raise RenameError(f"파일 이름을 변경하지 못했습니다: {source.name}. 파일 사용 여부와 폴더 권한을 확인해 주세요.") from exc
+    if not _matches(target, entry):
+        raise RenameError(f"변경 중 파일 내용이 바뀌었습니다: {source.name}")
 
 
 def _move_no_clobber(source: Path, target: Path, entry: dict[str, Any]) -> None:
@@ -104,16 +161,7 @@ def _move_no_clobber(source: Path, target: Path, entry: dict[str, Any]) -> None:
     if not _matches(source, entry):
         raise RenameError(f"파일이 변경되었습니다. 다시 확인해 주세요: {source.name}")
     if os.name == "nt":
-        try:
-            # Unlike POSIX rename, Windows os.rename fails if destination exists.
-            # This also supports photo folders on exFAT/FAT32 removable drives.
-            os.rename(source, target)
-        except FileExistsError as exc:
-            raise RenameError(f"같은 이름의 파일이 생겨 변경을 중단했습니다: {target.name}") from exc
-        except OSError as exc:
-            raise RenameError(f"파일 이름을 변경하지 못했습니다: {source.name}. 파일 사용 여부와 폴더 권한을 확인해 주세요.") from exc
-        if not _matches(target, entry):
-            raise RenameError(f"변경 중 파일 내용이 바뀌었습니다: {source.name}")
+        _move_windows(source, target, entry)
         return
     try:
         os.link(source, target, follow_symlinks=False)
@@ -189,6 +237,10 @@ def _validate_transaction(root: Path, transaction: Any) -> dict[str, Any]:
             seen.add(source)
             if any(not isinstance(entry[key], int) for key in ("size", "mtime_ns", "dev", "ino")):
                 raise ValueError
+            digest = entry.get("sha256")
+            if digest is not None and not (isinstance(digest, str) and len(digest) == 64
+                                           and all(char in "0123456789abcdef" for char in digest)):
+                raise ValueError
             photo_from_dict(entry["before"])
             photo_from_dict(entry["after"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -255,10 +307,11 @@ def _rollback(root: Path, cache: Cache, transaction: dict[str, Any]) -> None:
             if source is None:
                 raise RenameError("사진 복구 위치를 찾을 수 없습니다.")
             _move_no_clobber(source, temporary, entry)
-        # A crash between link and unlink can leave two copies of the same inode.
+        # A crash between link and unlink can leave two names for the same inode.
+        # A separate file with identical content is someone's copy: never remove it.
         for key in ("source", "target"):
             path = _path(root, entry[key])
-            if path != temporary and _matches(path, entry):
+            if path != temporary and _matches(path, entry) and _same_file(path, temporary):
                 path.unlink()
     for entry in entries:
         source = _path(root, entry["source"])
@@ -267,11 +320,35 @@ def _rollback(root: Path, cache: Cache, transaction: dict[str, Any]) -> None:
     (root / _PENDING).unlink()
 
 
+def _adopt_content_identity(root: Path, transaction: dict[str, Any]) -> None:
+    """Give journals written before 2.0.7 the content hash later checks rely on.
+
+    Those journals identify a photo by file ID alone, which FAT32/exFAT change
+    on rename, leaving the staged photo unrecognised. The three names belong to
+    this transaction, so one file among them with the recorded size and time is
+    that photo; anything less certain is left for the existing refusal.
+    """
+    changed = False
+    for entry in transaction["entries"]:
+        if entry.get("sha256"):
+            continue
+        paths = list(dict.fromkeys(_path(root, entry[key]) for key in ("temporary", "source", "target")))
+        found = [path for path in paths if _matches(path, entry)]
+        if not found:
+            found = [path for path in paths if _same_size_and_time(path, entry)]
+        if len(found) == 1 or (found and all(_same_file(found[0], path) for path in found)):
+            entry["sha256"] = _sha256(found[0])
+            changed = True
+    if changed:
+        atomic_json(root / _PENDING, transaction)
+
+
 def _recover_pending(root: Path, cache: Cache) -> None:
     transaction = _read_json(root / _PENDING, None)
     if transaction is None:
         return
     transaction = _validate_transaction(root, transaction)
+    _adopt_content_identity(root, transaction)
     if transaction["phase"] in {"files_committed", "metadata_done"}:
         _finish(root, cache, transaction)
     else:
@@ -381,10 +458,14 @@ def apply_names(root: Path, photos: list[Photo], cache: Cache) -> list[tuple[Pat
             if str(target) == str(source):
                 stationary.append(photo_to_dict(after))
                 continue
+            digest = _sha256(source)
+            if _fingerprint(source) != fingerprint:
+                raise RenameError(f"분석 후 파일 내용이 바뀌었습니다. 다시 분석해 주세요: {source.name}")
             entries.append({
                 "source": _relative(root, source), "target": _relative(root, target),
                 "temporary": _relative(root, source.parent / f".frametag-{transaction_id}-{len(entries)}.tmp"),
-                **fingerprint, "before": photo_to_dict(photo), "after": photo_to_dict(after),
+                **fingerprint, "sha256": digest,
+                "before": photo_to_dict(photo), "after": photo_to_dict(after),
             })
         if not entries:
             cache.put_many([after for _, after in after_photos])
@@ -413,8 +494,9 @@ def undo_last(root: Path, cache: Cache) -> list[tuple[Path, Path]]:
                 source = _path(root, prior["target"])
                 target = _path(root, prior["source"])
                 fingerprint = _fingerprint(source)
-                if fingerprint != {key: prior[key] for key in ("size", "mtime_ns", "dev", "ino")}:
+                if not _matches(source, prior):
                     raise RenameError(f"이름 변경 후 사진 내용이 바뀌어 되돌릴 수 없습니다: {source.name}")
+                digest = prior.get("sha256") or _sha256(source)
                 before = cache.get(source) or photo_from_dict(prior["after"])
                 after = photo_from_dict(prior["before"])
                 after.path = target
@@ -424,7 +506,8 @@ def undo_last(root: Path, cache: Cache) -> list[tuple[Path, Path]]:
                 entries.append({
                     "source": _relative(root, source), "target": _relative(root, target),
                     "temporary": _relative(root, source.parent / f".frametag-{transaction_id}-{index}.tmp"),
-                    **fingerprint, "before": photo_to_dict(before), "after": photo_to_dict(after),
+                    **fingerprint, "sha256": digest,
+                    "before": photo_to_dict(before), "after": photo_to_dict(after),
                 })
             except (KeyError, TypeError, ValueError) as exc:
                 raise RenameError("이름 변경 기록의 사진 정보가 올바르지 않습니다.") from exc

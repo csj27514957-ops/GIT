@@ -21,7 +21,7 @@ from .domain import (filename_from_analysis, is_gender_prefixed_filename, list_i
                      normalize_analysis, parse_frametag_filename,
                      sanitize_filename, select_through, unify_runs)
 from .models import Photo
-from .rename import apply_names, recover_pending, undo_last
+from .rename import apply_names, recover_pending, recovery_pending, undo_last
 from .storage import Cache, atomic_json
 
 
@@ -50,6 +50,7 @@ class Engine:
         self._stable: dict[str, tuple[tuple[int, int], int]] = {}
         self._last_poll = 0.0
         self._consecutive_failures = 0
+        self._rename_failures = 0
         self._manifest_error = ""
         self._worker = threading.Thread(target=self._run, name="FrameTag-worker", daemon=True)
         self._watcher = threading.Thread(target=self._run_watch, name="FrameTag-watch", daemon=True)
@@ -409,8 +410,19 @@ class Engine:
                         cache.put(photo)
                         self._mark(photo, "error")
                         self._publish()
-                        self._emit("error", f"자동 파일명 변경 실패: {exc}")
+                        self._rename_failures += 1
+                        message = f"자동 파일명 변경 실패: {exc}"
+                        # Every later rename would fail the same way, after a paid analysis.
+                        if recovery_pending(self._root):
+                            self._pause_for_failure(
+                                message + "\n이전 이름 변경의 복구가 끝나지 않아 자동 처리를 멈췄습니다. "
+                                "사진과 .frametag 파일을 그대로 두고 원인을 확인해 주세요.")
+                        elif self._rename_failures >= 3:
+                            self._pause_for_failure("3장 연속으로 파일명을 변경하지 못해 자동 처리를 멈췄습니다. " + message)
+                        else:
+                            self._emit("error", message)
                         return "rename_error"
+                    self._rename_failures = 0
                     self._remap(pairs)
                     self._mark(photo, "processed")
                 else:
