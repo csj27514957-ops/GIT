@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import io
 import json
 import re
+import secrets
 import threading
 import warnings
 from pathlib import Path
@@ -19,7 +21,7 @@ import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .domain import normalize_analysis
-from .model_catalog import DEFAULT_MODELS, photo_models
+from .model_catalog import RETIRED_NVIDIA_MODELS, photo_models
 
 
 ENDPOINTS = {
@@ -67,10 +69,21 @@ objects의 location은 손 또는 바닥만 사용하세요.
 
 
 class APIError(Exception):
-    def __init__(self, message: str, fatal: bool = False, *, status_code: int | None = None):
+    def __init__(self, message: str, fatal: bool = False, *, status_code: int | None = None,
+                 model_retired: str = "", retired_models: list[str] | None = None):
         super().__init__(message)
         self.fatal = fatal
         self.status_code = status_code
+        self.model_retired = model_retired
+        self.retired_models = list(retired_models or [])
+
+
+@dataclass
+class ModelDiscovery:
+    models: list[str]
+    retired: list[str]
+    catalog: list[str]
+    notes: list[str]
 
 
 def _safe_detail(value: str, key: str, limit: int = 900) -> str:
@@ -111,7 +124,8 @@ def _server_detail(response: httpx.Response, key: str) -> str:
     return _safe_detail(value, key) or "서버 오류 설명이 없습니다."
 
 
-def _http_error(message: str, response: httpx.Response, key: str, *, fatal=False) -> APIError:
+def _http_error(message: str, response: httpx.Response, key: str, *, fatal=False,
+                model_retired="") -> APIError:
     request = response.request
     # Fixed destination, without query parameters; no request headers or body.
     endpoint = str(request.url.copy_with(query=None, fragment=None))
@@ -120,7 +134,19 @@ def _http_error(message: str, response: httpx.Response, key: str, *, fatal=False
     request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
     if request_id:
         details.append("요청 ID: " + _safe_detail(request_id, key, 180))
-    return APIError("\n".join(details), fatal=fatal, status_code=response.status_code)
+    return APIError("\n".join(details), fatal=fatal, status_code=response.status_code,
+                    model_retired=model_retired)
+
+
+def _explicit_retirement(response: httpx.Response, key: str, model: str) -> str:
+    """A generic 410 is not evidence that a particular model was retired."""
+    if response.status_code != 410 or not model:
+        return ""
+    detail = _server_detail(response, key)
+    pattern = (r"\bmodel\s+['\"]?" + re.escape(model) +
+               r"['\"]?\s+(?:has\s+)?"
+               r"(?:reached its end of life|(?:is\s+)?no longer available)\b")
+    return model if re.search(pattern, detail, re.IGNORECASE) else ""
 
 
 class Cancelled(Exception):
@@ -229,21 +255,25 @@ async def _async_request(
     cancel: threading.Event,
     payload: dict[str, Any] | None,
     transport: Any,
+    timeout_seconds: float = 60,
 ) -> httpx.Response:
     _check_cancel(cancel)
-    timeout = httpx.Timeout(connect=10, read=60, write=20, pool=10)
+    timeout = httpx.Timeout(connect=10, read=timeout_seconds, write=20, pool=10)
     async with httpx.AsyncClient(timeout=timeout, transport=transport, follow_redirects=False) as client:
         request = asyncio.create_task(client.request(
             method, url, headers={"Authorization": "Bearer " + key}, json=payload,
         ))
         watcher = asyncio.create_task(_cancel_watch(cancel))
         try:
-            await asyncio.wait({request, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait({request, watcher}, timeout=timeout_seconds,
+                                         return_when=asyncio.FIRST_COMPLETED)
             if cancel.is_set():
                 request.cancel()
                 with suppress(asyncio.CancelledError):
                     await request
                 raise Cancelled()
+            if not done:
+                raise httpx.ReadTimeout("API request timed out")
             response = await request
             _check_cancel(cancel)
             return response
@@ -264,14 +294,16 @@ def _request(
     cancel: threading.Event,
     payload: dict[str, Any] | None = None,
     transport: Any = None,
+    *, attempts: int = MAX_ATTEMPTS, timeout_seconds: float = 60,
 ) -> httpx.Response:
-    for attempt in range(MAX_ATTEMPTS):
+    for attempt in range(attempts):
         _check_cancel(cancel)
         response = None
         try:
-            response = asyncio.run(_async_request(method, url, key, cancel, payload, transport))
+            response = asyncio.run(_async_request(method, url, key, cancel, payload, transport,
+                                                 timeout_seconds))
         except httpx.TransportError:
-            if attempt == MAX_ATTEMPTS - 1:
+            if attempt == attempts - 1:
                 raise APIError("API 연결에 실패했습니다. 인터넷 연결과 서버 상태를 확인하세요.") from None
         else:
             status = response.status_code
@@ -284,11 +316,17 @@ def _request(
             if status == 404:
                 raise _http_error("API 경로나 모델을 찾을 수 없습니다 (404). 모델 ID와 사용 권한을 확인하세요.", response, key, fatal=True)
             if status == 410:
-                raise _http_error("API가 요청을 거절했습니다 (410). 모델 제공 종료로 단정할 수 없습니다. "
-                                  "API 연결 진단에서 모델 목록과 분석 경로의 응답을 비교하세요.", response, key, fatal=True)
+                model = payload.get("model", "") if isinstance(payload, dict) else ""
+                retired = _explicit_retirement(response, key, model)
+                message = ("서버가 선택 모델의 제공 종료를 확인했습니다 (410). "
+                           "사용 가능한 모델 확인을 눌러 사진 입력이 검증된 모델을 선택하세요."
+                           if retired else
+                           "API가 요청을 거절했습니다 (410). 모델 제공 종료로 단정할 수 없습니다. "
+                           "API 연결 진단에서 모델 목록과 분석 경로의 응답을 비교하세요.")
+                raise _http_error(message, response, key, fatal=True, model_retired=retired)
             if status not in RETRY_STATUSES:
                 raise _http_error(f"API 요청 오류 ({status}). 서버 설명을 확인하세요.", response, key)
-            if attempt == MAX_ATTEMPTS - 1:
+            if attempt == attempts - 1:
                 raise _http_error(
                     f"API 요청이 반복해서 실패했습니다 ({status}). 사용 한도와 서버 상태를 확인하세요.",
                     response, key,
@@ -319,7 +357,15 @@ def _generation_options(provider: str, model: str) -> dict[str, Any]:
         options["chat_template_kwargs"] = {"enable_thinking": False}
     elif model == "mistralai/mistral-small-4-119b-2603":
         options["reasoning_effort"] = None
+    elif model == "moonshotai/kimi-k2.6":
+        options["chat_template_kwargs"] = {"thinking": False}
     return options
+
+
+def _vision_prompt(model: str, text: str) -> str:
+    if model == "nvidia/nemotron-nano-12b-v2-vl":
+        return "/no_think\n" + text
+    return text
 
 
 class Analyzer:
@@ -335,11 +381,15 @@ class Analyzer:
             raise APIError("선택한 공급자의 API 키를 입력하세요.", fatal=True)
         if not self.model:
             raise APIError("이미지 분석 모델 ID를 입력하세요.", fatal=True)
+        if self.provider == "NVIDIA" and self.model in RETIRED_NVIDIA_MODELS:
+            raise APIError("서버가 제공 종료를 확인한 모델입니다. 사용 가능한 모델 확인을 눌러 "
+                           "사진 입력이 검증된 모델을 선택하세요.", fatal=True,
+                           model_retired=self.model)
         image_url = _image_url(Path(path), cancel)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": PROMPT},
             {"role": "user", "content": [
-                {"type": "text", "text": "이 사진을 규칙에 따라 분석하고 JSON만 반환하세요."},
+                {"type": "text", "text": _vision_prompt(self.model, "이 사진을 규칙에 따라 분석하고 JSON만 반환하세요.")},
                 {"type": "image_url", "image_url": {"url": image_url}},
             ]},
         ]
@@ -399,6 +449,115 @@ def _catalog_ids(response: httpx.Response, cancel: threading.Event) -> list[str]
     return result
 
 
+def _vision_challenge(model: str) -> tuple[dict[str, Any], dict[str, str]]:
+    """An unpredictable, harmless image checks image input without using user files."""
+    colors = {"red": (255, 0, 0), "green": (0, 255, 0),
+              "blue": (0, 0, 255), "yellow": (255, 255, 0)}
+    left = secrets.choice(list(colors))
+    right = secrets.choice([name for name in colors if name != left])
+    expected = {"left": left, "right": right}
+    image = Image.new("RGB", (256, 128), colors[left])
+    image.paste(colors[right], (128, 0, 256, 128))
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=90)
+    uri = "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    prompt = ("Look at the attached image, which contains two solid color rectangles. "
+              "Identify the color on its left and on its right. "
+              "Use only red, green, blue or yellow. "
+              'Return a JSON object with keys "left" and "right", without explanation.')
+    payload = {"model": model, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": _vision_prompt(model, prompt)},
+        {"type": "image_url", "image_url": {"url": uri}},
+    ]}]}
+    payload.update(_generation_options("NVIDIA", model))
+    payload["max_tokens"] = 128
+    return payload, expected
+
+
+def _challenge_matches(content: str, expected: dict[str, str]) -> bool:
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(content):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        if all(isinstance(value.get(side), str) and value[side].strip().casefold() == color
+               for side, color in expected.items()):
+            return True
+    return False
+
+
+def discover_photo_models(
+    provider: str, key: str, preferred: str = "", cancel: threading.Event | None = None,
+    *, excluded=(), progress=None, transport: Any = None,
+) -> ModelDiscovery:
+    """Offer only catalog models that actually understand a synthetic image.
+
+    This is not a photographic quality benchmark. No user file is opened and
+    no photograph is sent. At most eight candidates and three successful
+    candidates are checked; every probe has one attempt, with cancellation.
+    """
+    provider = _provider_name(provider)
+    key = key.strip()
+    cancel = cancel if cancel is not None else threading.Event()
+    _check_cancel(cancel)
+    if not key:
+        raise APIError("모델 목록을 조회하려면 해당 공급자의 API 키를 입력하세요.", fatal=True)
+    response = _request("GET", ENDPOINTS[provider] + "/models", key, cancel,
+                        transport=transport, attempts=1, timeout_seconds=30)
+    catalog = _catalog_ids(response, cancel)
+    if provider != "NVIDIA":
+        return ModelDiscovery(photo_models(provider, catalog), [], catalog, [])
+    skipped = set(excluded) | RETIRED_NVIDIA_MODELS
+    candidates = [model for model in photo_models(provider, catalog) if model not in skipped]
+    preferred = preferred.strip()
+    if preferred and preferred in catalog and preferred not in skipped:
+        if preferred in candidates:
+            candidates.remove(preferred)
+        candidates.insert(0, preferred)
+    candidates = candidates[:8]
+    verified, retired, notes = [], [], []
+    for index, model in enumerate(candidates, 1):
+        _check_cancel(cancel)
+        if progress is not None:
+            progress(index, len(candidates), model)
+        payload, expected = _vision_challenge(model)
+        try:
+            response = _request("POST", ENDPOINTS[provider] + "/chat/completions", key, cancel,
+                                payload, transport, attempts=1, timeout_seconds=30)
+        except APIError as error:
+            if error.model_retired:
+                retired.append(error.model_retired)
+                notes.append(f"{model}: 서버가 모델 제공 종료를 확인했습니다.")
+                continue
+            # A missing individual model or a rejected image may be skipped.
+            # Auth, quota, generic 410, or network failure affects the whole check.
+            if error.status_code == 404 or (error.status_code == 400 and
+                    re.search(r"image|vision|multimodal|사진|이미지", str(error), re.IGNORECASE)):
+                notes.append(f"{model}: 사진 입력을 확인하지 못했습니다. {error}")
+                continue
+            error.retired_models = list(retired)
+            raise
+        try:
+            content = _message_text(response)
+        except APIError:
+            notes.append(f"{model}: 사진 확인 응답을 읽을 수 없습니다.")
+            continue
+        _check_cancel(cancel)
+        if _challenge_matches(content, expected):
+            verified.append(model)
+            if len(verified) == 3:
+                break
+        else:
+            notes.append(f"{model}: 테스트 이미지의 실제 색상과 위치를 확인하지 못했습니다.")
+    _check_cancel(cancel)
+    return ModelDiscovery(verified, retired, catalog, notes)
+
+
 def diagnose_connection(
     provider: str, model: str, key: str, cancel: threading.Event | None = None,
     *, transport: Any = None,
@@ -408,10 +567,10 @@ def diagnose_connection(
     key, model = key.strip(), model.strip()
     cancel = cancel if cancel is not None else threading.Event()
     _check_cancel(cancel)
-    if not key or not model:
-        raise APIError("진단하려면 API 키와 모델 ID를 입력하세요.", fatal=True)
+    if not key:
+        raise APIError("진단하려면 API 키를 입력하세요.", fatal=True)
     report = ["FrameTag API 연결 진단", f"공급자: {provider}",
-              "선택 모델: " + _safe_detail(model, key),
+              "선택 모델: " + (_safe_detail(model, key) or "미선택"),
               "사진·파일 경로·API 키는 진단 결과에 포함하지 않습니다.", ""]
     base = ENDPOINTS[provider]
     report.append(f"1. 모델 목록: GET {base}/models")
@@ -427,7 +586,17 @@ def diagnose_connection(
     else:
         report.append(f"선택 모델이 서버 목록에 {'있습니다' if model in available else '없습니다'}.")
         candidates = photo_models(provider, available)
-        report.append("추천 사진 모델: " + (_safe_detail(", ".join(candidates), key) or "목록에 없음"))
+        report.append("사진 확인 후보 모델: " + (_safe_detail(", ".join(candidates), key) or "목록에 없음"))
+        report.append("모델 목록만으로 사진 입력 지원이나 현재 분석 가능 여부가 검증되지는 않습니다.")
+        report.append(f"서버 모델 수: {len(available)}")
+        report.append("서버 모델 ID 목록 (최대 500개):")
+        report.extend(_safe_detail(identifier, key, 180) for identifier in available[:500])
+        if len(available) > 500:
+            report.append(f"나머지 {len(available) - 500}개 생략")
+    if not model:
+        report.append("\n모델이 선택되지 않아 분석 경로 요청을 생략했습니다.")
+        _check_cancel(cancel)
+        return "\n".join(report)
     report.extend(["", f"2. 분석 경로: POST {base}/chat/completions",
                    "사진 없이 짧은 텍스트 요청을 보냅니다. API 사용량이 소량 발생할 수 있습니다."])
     payload = {"model": model, "messages": [{"role": "user", "content": 'Reply with JSON: {"ok":true}'}]}

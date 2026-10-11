@@ -12,8 +12,9 @@ from unittest.mock import patch
 import httpx
 from PIL import Image
 
-from frametag.api import Analyzer, APIError, Cancelled, _retry_delay, diagnose_connection, list_models
-from frametag.model_catalog import DEFAULT_MODELS, model_id, model_label, restore_model
+from frametag.api import (Analyzer, APIError, Cancelled, _request, _retry_delay,
+                          diagnose_connection, discover_photo_models, list_models)
+from frametag.model_catalog import NVIDIA_DISCOVERABLE, model_id, model_label, restore_model
 
 
 GOOD = {
@@ -28,6 +29,20 @@ def reply(content=None, status=200, headers=None):
         content = json.dumps(GOOD, ensure_ascii=False)
     return httpx.Response(status, headers=headers,
                           json={"choices": [{"message": {"content": content}}]})
+
+
+def challenge_reply(request):
+    """The fake model must inspect actual pixels rather than echoing prompt JSON."""
+    payload = json.loads(request.content)
+    content = payload["messages"][0]["content"]
+    uri = next(part["image_url"]["url"] for part in content if part["type"] == "image_url")
+    palette = {"red": (255, 0, 0), "green": (0, 255, 0),
+               "blue": (0, 0, 255), "yellow": (255, 255, 0)}
+    with Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))) as image:
+        colors = [image.getpixel((64, 64)), image.getpixel((192, 64))]
+    names = [min(palette, key=lambda name: sum((a - b) ** 2
+                 for a, b in zip(color, palette[name]))) for color in colors]
+    return reply(json.dumps(dict(zip(("left", "right"), names))))
 
 
 class APITests(unittest.TestCase):
@@ -281,28 +296,32 @@ class APITests(unittest.TestCase):
             self.assertEqual(str(request.url), "https://integrate.api.nvidia.com/v1/models")
             return httpx.Response(200, json={"data": [{"id": name} for name in available]})
         self.assertEqual(list_models("NVIDIA", "test-placeholder", transport=httpx.MockTransport(handler)),
-                         ["qwen/qwen3.5-122b-a10b", "qwen/qwen3.5-397b-a17b",
-                          "nvidia/nemotron-3-nano-omni-30b-a3b"])
+                         ["nvidia/nemotron-3-nano-omni-30b-a3b", "nvidia/nemotron-nano-12b-v2-vl",
+                          "qwen/qwen3.5-397b-a17b"])
 
     def test_each_recommended_nvidia_model_uses_its_vision_request_options(self):
-        for identifier in DEFAULT_MODELS["NVIDIA"]:
+        for identifier in NVIDIA_DISCOVERABLE:
             with self.subTest(model=identifier):
                 def handler(request):
                     payload = json.loads(request.content)
                     self.assertEqual(payload["model"], identifier)
                     self.assertEqual(payload["messages"][1]["content"][1]["type"], "image_url")
                     self.assertEqual(payload["max_tokens"], 1600)
-                    if identifier.startswith("qwen/"):
+                    if identifier == "qwen/qwen3.5-397b-a17b":
                         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
-                    else:
+                    elif identifier == "mistralai/mistral-small-4-119b-2603":
                         self.assertIn("reasoning_effort", payload)
                         self.assertIsNone(payload["reasoning_effort"])
+                    elif identifier == "moonshotai/kimi-k2.6":
+                        self.assertEqual(payload["chat_template_kwargs"], {"thinking": False})
+                    if identifier == "nvidia/nemotron-nano-12b-v2-vl":
+                        self.assertTrue(payload["messages"][1]["content"][0]["text"].startswith("/no_think"))
                     return reply()
                 result = Analyzer("NVIDIA", identifier, "test-placeholder", transport=httpx.MockTransport(handler)).analyze(
                     self.photo, threading.Event())
                 self.assertEqual(result["gender"], "남성")
 
-    def test_legacy_saved_selection_migrates_but_explicit_model_is_not_blocked(self):
+    def test_confirmed_retired_selection_clears_but_other_explicit_model_is_preserved(self):
         legacy = "nvidia/nemotron-nano-12b-v2-vl"
         requests = []
         def handler(request):
@@ -311,10 +330,22 @@ class APITests(unittest.TestCase):
         analyzer = Analyzer("NVIDIA", legacy, "test-placeholder", transport=httpx.MockTransport(handler))
         self.assertEqual(analyzer.analyze(self.photo, threading.Event())["gender"], "남성")
         self.assertEqual(requests, [legacy])
-        self.assertEqual(restore_model("NVIDIA", legacy), DEFAULT_MODELS["NVIDIA"][0])
-        for identifier in DEFAULT_MODELS["NVIDIA"]:
+        self.assertEqual(restore_model("NVIDIA", legacy), legacy)
+        self.assertEqual(restore_model("NVIDIA", "qwen/qwen3.5-122b-a10b"), "")
+        for identifier in NVIDIA_DISCOVERABLE:
             self.assertEqual(model_id("NVIDIA", model_label("NVIDIA", identifier)), identifier)
         self.assertEqual(restore_model("OpenAI", "custom-vision-id"), "custom-vision-id")
+
+    def test_confirmed_builtin_retired_model_never_reads_or_uploads_a_photo(self):
+        model = "qwen/qwen3.5-122b-a10b"
+        analyzer = Analyzer("NVIDIA", model, "placeholder", transport=httpx.MockTransport(
+            lambda request: self.fail("A confirmed retired model must not send a request")))
+        with patch("frametag.api._image_url", side_effect=AssertionError("User photo read")):
+            with self.assertRaises(APIError) as caught:
+                analyzer.analyze(Path("missing-user-photo.jpg"), threading.Event())
+        self.assertTrue(caught.exception.fatal)
+        self.assertEqual(caught.exception.model_retired, model)
+        self.assertIsNone(caught.exception.status_code)
 
     def test_error_retains_server_reason_and_request_id_without_echoed_secrets(self):
         key = "nvapi-dummy-private-value"
@@ -370,7 +401,7 @@ class APITests(unittest.TestCase):
 
     def test_diagnostic_compares_catalog_and_inference_without_photo_data(self):
         key = "nvapi-dummy-diagnostic-key"
-        model = DEFAULT_MODELS["NVIDIA"][0]
+        model = "qwen/qwen3.5-397b-a17b"
         requests = []
         def handler(request):
             requests.append(request)
@@ -455,6 +486,221 @@ class APITests(unittest.TestCase):
         thread.join(1)
         self.assertLess(time.monotonic() - start, 1)
         self.assertEqual(calls, ["GET"])
+
+    def test_explicit_model_retirement_requires_matching_requested_model(self):
+        model = "vendor/test-vision"
+        descriptions = [
+            (f"The model '{model}' has reached its end of life on 2026-07-20 and is no longer available.", model),
+            (f"The model '{model}' is no longer available.", model),
+            ("The model 'different-model' has reached its end of life and is no longer available.", ""),
+            (f"The model '{model}' is active. The model 'another-model' has reached its end of life.", ""),
+            (f"Route gone for {model}; contact the account owner.", ""),
+        ]
+        for description, retired in descriptions:
+            with self.subTest(description=description):
+                def handler(request):
+                    return httpx.Response(410, json={"error": {"message": description}})
+                with self.assertRaises(APIError) as caught:
+                    Analyzer("NVIDIA", model, "placeholder", transport=httpx.MockTransport(handler)).analyze(
+                        self.photo, threading.Event())
+                self.assertEqual(caught.exception.model_retired, retired)
+                self.assertIn(description, str(caught.exception))
+
+    def test_discovery_offers_only_actually_verified_images_and_never_opens_user_files(self):
+        available = ["meta/llama-3.3-70b-instruct", "vendor/new-vision-v1",
+                     "nvidia/nemotron-nano-12b-v2-vl"]
+        requests, progress = [], []
+        def handler(request):
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": name} for name in available]})
+            payload = json.loads(request.content)
+            self.assertEqual(payload["max_tokens"], 128)
+            self.assertNotIn(str(self.photo), request.content.decode())
+            self.assertNotIn("photo.png", request.content.decode())
+            return challenge_reply(request)
+        with patch("frametag.api._image_url", side_effect=AssertionError("User image read")):
+            result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler),
+                                           progress=lambda *values: progress.append(values))
+        self.assertEqual(result.models, ["nvidia/nemotron-nano-12b-v2-vl", "vendor/new-vision-v1"])
+        self.assertEqual(result.catalog, sorted(available))
+        self.assertFalse(result.retired)
+        self.assertEqual(progress, [(1, 2, result.models[0]), (2, 2, result.models[1])])
+        self.assertEqual(len(requests), 3)
+
+    def test_successful_text_response_without_correct_image_colors_is_not_verified(self):
+        model = "vendor/new-vision-v1"
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model}]})
+            return reply('{"left":"blue","right":"red"}')
+        with patch("frametag.api.secrets.choice", side_effect=["red", "green"]):
+            result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, [])
+        self.assertEqual(len(result.notes), 1)
+        self.assertIn("색상과 위치", result.notes[0])
+
+    def test_discovery_skips_confirmed_and_saved_retired_ids_without_probing(self):
+        model = "vendor/remaining-vision"
+        retired = "qwen/qwen3.5-122b-a10b"
+        excluded = "vendor/saved-retired-vision"
+        probed = []
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": identifier}
+                    for identifier in (model, retired, excluded)]})
+            probed.append(json.loads(request.content)["model"])
+            return challenge_reply(request)
+        result = discover_photo_models("NVIDIA", "placeholder", preferred=retired, excluded=(excluded,),
+                                       transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, [model])
+        self.assertEqual(probed, [model])
+
+    def test_discovery_handles_individual_retirement_and_unsupported_images(self):
+        models = ["vendor/a-vision", "vendor/b-vision", "vendor/c-vision", "vendor/d-vision"]
+        requests = []
+        def handler(request):
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+            model = json.loads(request.content)["model"]
+            if model == models[0]:
+                return httpx.Response(410, json={"error": {"message":
+                    f"The model '{model}' has reached its end of life and is no longer available."}})
+            if model == models[1]:
+                return httpx.Response(400, json={"error": "Image input is not supported"})
+            if model == models[2]:
+                return httpx.Response(404, json={"error": "Model not found"})
+            return challenge_reply(request)
+        result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, [models[3]])
+        self.assertEqual(result.retired, [models[0]])
+        self.assertEqual(len(result.notes), 3)
+        self.assertEqual(len(requests), 5)
+
+    def test_auth_quota_and_generic_410_abort_discovery_without_trying_other_models(self):
+        models = ["vendor/a-vision", "vendor/b-vision"]
+        for status in (401, 402, 403, 429, 410, 503):
+            with self.subTest(status=status):
+                calls = []
+                def handler(request):
+                    calls.append(request.method)
+                    if request.method == "GET":
+                        return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+                    return httpx.Response(status, json={"error": "Account route unavailable"})
+                with self.assertRaises(APIError) as caught:
+                    discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+                self.assertEqual(calls, ["GET", "POST"])
+                self.assertEqual(caught.exception.status_code, status)
+                self.assertEqual(caught.exception.model_retired, "")
+                self.assertEqual(caught.exception.retired_models, [])
+
+    def test_later_global_discovery_error_preserves_previously_confirmed_retirement(self):
+        models = ["vendor/a-vision", "vendor/b-vision"]
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+            model = json.loads(request.content)["model"]
+            if model == models[0]:
+                return httpx.Response(410, json={"error": f"The model '{model}' is no longer available."})
+            return httpx.Response(403, json={"error": "Account restricted"})
+        with self.assertRaises(APIError) as caught:
+            discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(caught.exception.retired_models, [models[0]])
+
+    def test_discovery_limit_and_preferred_catalog_model(self):
+        models = [f"vendor/test-{index:02d}-vision" for index in range(12)]
+        preferred = "vendor/custom-model"
+        probed = []
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in [*models, preferred]]})
+            probed.append(json.loads(request.content)["model"])
+            return reply("not a color response")
+        result = discover_photo_models("NVIDIA", "placeholder", preferred=preferred,
+                                       transport=httpx.MockTransport(handler))
+        self.assertEqual(probed, [preferred, *models[:7]])
+        self.assertEqual(result.models, [])
+        self.assertEqual(len(result.catalog), 13)
+
+    def test_discovery_stops_after_three_verified_models(self):
+        models = [f"vendor/test-{index:02d}-vision" for index in range(8)]
+        probed = []
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+            probed.append(json.loads(request.content)["model"])
+            return challenge_reply(request)
+        result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, models[:3])
+        self.assertEqual(probed, models[:3])
+
+    def test_discovery_network_failure_is_not_retried(self):
+        calls = []
+        def handler(request):
+            calls.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "vendor/test-vision"}]})
+            raise httpx.ConnectError("unavailable", request=request)
+        with self.assertRaises(APIError):
+            discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(calls, ["GET", "POST"])
+
+    def test_cancellation_interrupts_model_image_probe(self):
+        started, ended, cancel = threading.Event(), threading.Event(), threading.Event()
+        results, calls = [], []
+        async def handler(request):
+            calls.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "vendor/test-vision"}]})
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            finally:
+                ended.set()
+        def run():
+            try:
+                results.append(discover_photo_models("NVIDIA", "placeholder", cancel=cancel,
+                                                     transport=httpx.MockTransport(handler)))
+            except Exception as error:
+                results.append(error)
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(started.wait(1))
+        cancel.set()
+        worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(ended.is_set())
+        self.assertIsInstance(results[0], Cancelled)
+        self.assertEqual(calls, ["GET", "POST"])
+
+    def test_single_request_has_total_timeout_and_cancels_transport(self):
+        ended = threading.Event()
+        async def handler(request):
+            try:
+                await asyncio.sleep(10)
+            finally:
+                ended.set()
+        started = time.monotonic()
+        with self.assertRaises(APIError):
+            _request("GET", "https://test.invalid/models", "placeholder", threading.Event(),
+                     transport=httpx.MockTransport(handler), attempts=1, timeout_seconds=0.03)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(ended.is_set())
+
+    def test_catalog_only_diagnostic_preserves_raw_ids_without_inference(self):
+        models = ["vendor/text-only", "vendor/new-vision"]
+        calls = []
+        def handler(request):
+            calls.append(request.method)
+            return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+        report = diagnose_connection("NVIDIA", "", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(calls, ["GET"])
+        self.assertIn("서버 모델 수: 2", report)
+        self.assertIn("vendor/text-only", report)
+        self.assertIn("vendor/new-vision", report)
+        self.assertIn("미선택", report)
+        self.assertIn("생략", report)
 
 
 if __name__ == "__main__":

@@ -861,6 +861,95 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(statuses[-1], "오류로 분석을 중지했습니다. API 설정을 확인한 뒤 다시 시작하세요.")
         self.assertNotIn("남은 사진 분석을 마쳤습니다.", statuses)
 
+    def test_explicit_retirement_emits_current_model_before_stopping_batch(self):
+        self.photo("first.png")
+        self.photo("second.png")
+        failure = APIError("Selected model has reached its end of life", fatal=True,
+                           status_code=410)
+        failure.model_retired = "fake-model"
+        self.api.failure = failure
+        engine = self.engine()
+        engine.configure("NVIDIA", "fake-model", "test-placeholder")
+        engine.start_analysis()
+        self.idle(engine)
+        self.assertEqual([call[0] for call in self.api.calls], ["first.png"])
+        retired = [(kind, value) for kind, value in self.events if kind == "model_retired"]
+        self.assertEqual(retired, [("model_retired", ("NVIDIA", "fake-model"))])
+        retirement_index = self.events.index(retired[0])
+        halt_index = next(index for index, (kind, _value) in enumerate(self.events)
+                          if kind == "error")
+        self.assertLess(retirement_index, halt_index)
+        self.assertEqual(engine.get_photos()[1].status, "대기")
+
+    def test_generic_410_and_another_models_retirement_do_not_emit_retirement(self):
+        self.photo()
+        engine = self.engine()
+        for model_retired in (None, "different-model"):
+            with self.subTest(model_retired=model_retired):
+                failure = APIError("API route returned HTTP 410", fatal=True, status_code=410)
+                failure.model_retired = model_retired
+                self.api.failure = failure
+                engine.start_analysis()
+                self.idle(engine)
+                self.assertFalse(any(kind == "model_retired" for kind, _value in self.events))
+        self.assertEqual(len(self.api.calls), 2)
+        self.assertEqual(sum(kind == "error" for kind, _value in self.events), 2)
+
+    def test_old_key_explicit_retirement_does_not_exclude_current_model(self):
+        self.photo()
+        self.api.release.clear()
+        old_key, new_key = "old-key-placeholder", "new-key-placeholder"
+        calls = []
+        outer = self
+
+        def factory(provider, model, key):
+            class Analyzer:
+                def analyze(_self, path, cancel):
+                    calls.append((path.name, model, key))
+                    if key == old_key:
+                        outer.api.entered.set()
+                        while not outer.api.release.wait(.01):
+                            if cancel.is_set():
+                                raise Cancelled()
+                        failure = APIError("Selected model has reached its end of life",
+                                           fatal=True, status_code=410)
+                        failure.model_retired = model
+                        raise failure
+                    return RESULT
+
+            return Analyzer()
+
+        engine = self.engine(analyzer_factory=factory)
+        engine.configure("NVIDIA", "fake-model", old_key)
+        engine.start_analysis()
+        self.assertTrue(self.api.entered.wait(2))
+        engine.configure("NVIDIA", "fake-model", new_key)
+        self.api.release.set()
+        self.idle(engine)
+        self.assertEqual([key for _name, _model, key in calls], [old_key, new_key])
+        self.assertFalse(any(kind in {"model_retired", "error"} for kind, _value in self.events))
+        self.assertEqual(engine.get_photos()[0].status, "분석 완료")
+
+    def test_current_model_retirement_preserves_concurrent_manual_edit_and_halts(self):
+        path = self.photo()
+        failure = APIError("Selected model has reached its end of life", fatal=True,
+                           status_code=410)
+        failure.model_retired = "fake-model"
+        self.api.failure = failure
+        self.api.release.clear()
+        engine = self.engine()
+        engine.start_analysis()
+        self.assertTrue(self.api.entered.wait(2))
+        engine.update_photo(str(path), "clothing", "직접입력의상")
+        self.api.release.set()
+        self.idle(engine)
+        photo = engine.get_photos()[0]
+        self.assertEqual(photo.status, "수동 수정")
+        self.assertEqual(photo.analysis["clothing"], ["직접입력의상"])
+        self.assertFalse(photo.error)
+        self.assertIn(("model_retired", ("OpenAI", "fake-model")), self.events)
+        self.assertTrue(any(kind == "error" for kind, _value in self.events))
+
     def test_three_nonfatal_errors_pause_without_retry_loop(self):
         self.api.failure = APIError("일시 오류")
         engine = self.engine()

@@ -11,9 +11,10 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from frametag.api import APIError, Cancelled, ModelDiscovery
 from frametag.engine import Engine
 from frametag.models import Photo
-from frametag.model_catalog import DEFAULT_MODELS, model_label
+from frametag.model_catalog import NVIDIA_DISCOVERABLE, NVIDIA_UNVERIFIED_LABEL, model_label
 from frametag.storage import Cache, SettingsStore
 from frametag.ui import FrameTagApp
 
@@ -77,6 +78,7 @@ class UITests(unittest.TestCase):
         self.wait(lambda: time.monotonic() >= deadline)
         self.app.folder.set(str(self.folder))
         self.app.api_key.set("mock-nvidia-key-not-valid")
+        self._verify_model_for_test()
         self.app._load_folder()
         self.wait(lambda: len(self.app.photos) == 3 and not self.app._loading)
 
@@ -91,6 +93,10 @@ class UITests(unittest.TestCase):
         for app in self.apps:
             if not app._closed:
                 app._exit()
+
+    def _verify_model_for_test(self, model="test-vision-model"):
+        self.app.model.set(model)
+        self.app._verified_models[("NVIDIA", self.app.api_key.get().strip())] = {model}
 
     def wait(self, predicate, timeout=4):
         deadline = time.monotonic() + timeout
@@ -163,6 +169,7 @@ class UITests(unittest.TestCase):
 
         with patch.object(self.app.engine, "_factory", side_effect=factory):
             self.app.api_key.set(new_key)
+            self._verify_model_for_test()
             self.app._analyze()
             self.wait(lambda: all(photo.analysis for photo in self.app.photos) and not self.app._busy)
         self.assertEqual(len(captured), 3)
@@ -173,11 +180,20 @@ class UITests(unittest.TestCase):
 
     def test_model_discovery_uses_entered_key_before_save_debounce(self):
         new_key = "mock-discovery-nvidia-key-not-valid"
-        with patch("frametag.ui.list_models", return_value=DEFAULT_MODELS["NVIDIA"]) as lookup:
+        available = list(NVIDIA_DISCOVERABLE)[:3]
+        result = ModelDiscovery(available, [], available, [])
+        preferred = self.app.model.get()
+        with patch("frametag.ui.discover_photo_models", return_value=result) as lookup:
             self.app.api_key.set(new_key)
             self.app._fetch_models()
-            self.wait(lambda: lookup.called and str(self.app.models_button["state"]) == "normal")
-        lookup.assert_called_once_with("NVIDIA", new_key)
+            self.wait(lambda: lookup.called and not self.app._models_pending)
+        self.assertEqual(lookup.call_count, 1)
+        self.assertEqual(lookup.call_args.args[:2], ("NVIDIA", new_key))
+        self.assertEqual(lookup.call_args.args[2], preferred)
+        self.assertIsInstance(lookup.call_args.args[3], threading.Event)
+        self.assertTrue(callable(lookup.call_args.kwargs["progress"]))
+        self.assertIn("excluded", lookup.call_args.kwargs)
+        self.assertEqual(self.app._verified_models[("NVIDIA", new_key)], set(available))
         self.assertFalse(self.errors)
 
     def test_failed_key_persistence_still_updates_current_session_key(self):
@@ -198,19 +214,19 @@ class UITests(unittest.TestCase):
         self.assertNotIn(new_key, self.settings.path.read_text(encoding="utf-8"))
         self.assertFalse(self.errors)
 
-    def test_legacy_model_migrates_and_friendly_choices_save_actual_api_id(self):
+    def test_retired_model_restores_blank_and_verified_choices_save_actual_api_id(self):
         self.app._save_settings()
         self.app._exit()
         saved = self.settings.load()
-        saved["models"]["NVIDIA"] = "nvidia/nemotron-nano-12b-v2-vl"
+        saved["models"]["NVIDIA"] = "qwen/qwen3.5-122b-a10b"
         self.settings.save(saved)
         self.app = self._new_app()
-        default = DEFAULT_MODELS["NVIDIA"][0]
-        self.assertEqual(self.app.model.get(), default)
-        self.assertEqual(self.app.model_choice.get(), model_label("NVIDIA", default))
+        self.assertEqual(self.app.model.get(), "")
+        self.assertEqual(self.app.model_choice.get(), NVIDIA_UNVERIFIED_LABEL)
         self.wait(lambda: len(self.app.photos) == 3 and not self.app._loading)
-        available = DEFAULT_MODELS["NVIDIA"][1:]
-        with patch("frametag.ui.list_models", return_value=available):
+        available = list(NVIDIA_DISCOVERABLE)[:3]
+        result = ModelDiscovery(available, [], available, [])
+        with patch("frametag.ui.discover_photo_models", return_value=result):
             self.app._fetch_models()
             self.wait(lambda: self.app.model.get() == available[0])
         self.assertEqual(list(self.app.model_combo["values"]), [model_label("NVIDIA", name) for name in available])
@@ -218,6 +234,203 @@ class UITests(unittest.TestCase):
         self.app._save_settings()
         self.assertEqual(self.settings.load()["models"]["NVIDIA"], available[1])
         self.assertFalse(self.errors)
+
+    def test_nvidia_analysis_and_auto_watch_require_current_key_verification(self):
+        self.app._verified_models.clear()
+        with patch("frametag.ui.discover_photo_models", return_value=ModelDiscovery([], [], [], [])) as lookup:
+            for selected in ("", next(iter(NVIDIA_DISCOVERABLE))):
+                with self.subTest(selected=selected):
+                    self.app.model.set(selected)
+                    self.assertFalse(self.app._ready())
+                    self.app._analyze()
+                    self.app.auto_watch.set(True)
+                    self.app._toggle_auto()
+                    self.assertFalse(self.app.auto_watch.get())
+            self.wait(lambda: not self.app._models_pending)
+            self.assertGreaterEqual(lookup.call_count, 1)
+        self.assertFalse(self.app.engine.is_busy())
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+
+    def test_discovery_offers_only_live_verified_models_before_photo_analysis(self):
+        available = list(NVIDIA_DISCOVERABLE)[:2]
+        result = ModelDiscovery([available[1]], [], available + ["text-only-model"], [])
+        self.app._verified_models.clear()
+        with patch("frametag.ui.discover_photo_models", return_value=result):
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending and self.app.model.get() == available[1])
+        self.assertEqual(list(self.app.model_combo["values"]), [model_label("NVIDIA", available[1])])
+        self.assertEqual(self.app._verified_models[("NVIDIA", self.app.api_key.get())], {available[1]})
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertTrue(self.app._ready())
+        self.app._analyze()
+        self.wait(lambda: len(FakeAnalyzer.calls) == 3 and not self.app._busy)
+        self.assertFalse(self.errors)
+
+    def test_empty_verified_result_clears_stale_model_and_prevents_photo_calls(self):
+        catalog = list(NVIDIA_DISCOVERABLE)[:2]
+        result = ModelDiscovery([], [], catalog, ["테스트 이미지 확인 실패"])
+        with patch("frametag.ui.discover_photo_models", return_value=result):
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending)
+        self.assertEqual(self.app.model.get(), "")
+        self.assertEqual(self.app.model_choice.get(), NVIDIA_UNVERIFIED_LABEL)
+        self.assertFalse(self.app._verified_models.get(("NVIDIA", self.app.api_key.get())))
+        with patch("frametag.ui.discover_photo_models", return_value=result):
+            self.assertFalse(self.app._ready())
+            self.app._analyze()
+            self.wait(lambda: not self.app._models_pending)
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+
+    def test_startup_auto_watch_checks_saved_key_before_enable_and_new_photo_analysis(self):
+        saved_key = self.app.api_key.get()
+        self.app.auto_watch.set(True)
+        self.app._save_settings()
+        self.app._exit()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        available = ["test-vision-model"]
+
+        def lookup(provider, key, preferred, cancel, **kwargs):
+            entered.set()
+            release.wait(3)
+            return ModelDiscovery(available, [], available, [])
+
+        with patch("frametag.ui.discover_photo_models", side_effect=lookup) as discovery:
+            self.app = self._new_app()
+            self.wait(entered.is_set)
+            self.assertFalse(self.app.auto_watch.get())
+            self.assertFalse(self.app.engine._auto)
+            self.assertEqual(FakeAnalyzer.calls, [])
+            self.assertEqual(discovery.call_args.args[:2], ("NVIDIA", saved_key))
+            release.set()
+            self.wait(lambda: self.app.auto_watch.get() and self.app.engine._auto)
+        incoming = self.folder / "incoming.jpg"
+        Image.new("RGB", (45, 65), "white").save(incoming)
+        self.wait(lambda: sum(photo.confirmed for photo in self.app.photos) == 1
+                  and not self.app._busy)
+        self.assertEqual(FakeAnalyzer.calls, ["incoming.jpg"])
+        self.assertTrue(all((self.folder / f"photo{number}.jpg").exists()
+                            for number in range(1, 4)))
+        self.assertFalse(self.errors)
+
+    def test_startup_does_not_enable_auto_with_a_different_verified_model(self):
+        self.app.auto_watch.set(True)
+        self.app._save_settings()
+        self.app._exit()
+        replacement = next(iter(NVIDIA_DISCOVERABLE))
+        result = ModelDiscovery([replacement], [], [replacement], [])
+        with patch("frametag.ui.discover_photo_models", return_value=result) as discovery:
+            self.app = self._new_app()
+            self.wait(lambda: discovery.called and not self.app._models_pending
+                      and self.app.model.get() == replacement)
+        self.assertFalse(self.app.auto_watch.get())
+        self.assertFalse(self.app.engine._auto)
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertTrue(all((self.folder / f"photo{number}.jpg").exists()
+                            for number in range(1, 4)))
+        self.assertFalse(self.errors)
+
+    def test_server_retired_model_persists_and_is_not_offered_after_restart(self):
+        available, retired = list(NVIDIA_DISCOVERABLE)[:2]
+        self._verify_model_for_test(retired)
+        result = ModelDiscovery([available], [retired], [available, retired], [])
+        with patch("frametag.ui.discover_photo_models", return_value=result):
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending and self.app.model.get() == available)
+        self.app._save_settings()
+        self.assertIn(retired, self.settings.load()["retired_nvidia_models"])
+        self.app._exit()
+        # A stale preference must not resurrect a model the server has retired.
+        saved = self.settings.load()
+        saved["models"]["NVIDIA"] = retired
+        self.settings.save(saved)
+        self.app = self._new_app()
+        self.assertEqual(self.app.model.get(), "")
+        self.assertEqual(self.app.model_choice.get(), NVIDIA_UNVERIFIED_LABEL)
+        self.wait(lambda: len(self.app.photos) == 3 and not self.app._loading)
+        with patch("frametag.ui.discover_photo_models", return_value=result) as discovery:
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending and self.app.model.get() == available)
+        self.assertIn(retired, discovery.call_args.kwargs["excluded"])
+        self.assertNotIn(model_label("NVIDIA", retired), self.app.model_combo["values"])
+        self.assertNotIn(retired, self.app._verified_models[("NVIDIA", self.app.api_key.get())])
+        self.assertFalse(self.errors)
+
+    def test_model_verification_animates_and_can_be_cancelled_without_blocking_gui(self):
+        entered = threading.Event()
+
+        def lookup(provider, key, preferred, cancel, **kwargs):
+            entered.set()
+            if not cancel.wait(3):
+                raise AssertionError("Model verification was not cancelled")
+            raise Cancelled()
+
+        with patch("frametag.ui.discover_photo_models", side_effect=lookup):
+            started = time.monotonic()
+            self.app._fetch_models()
+            self.assertLess(time.monotonic() - started, .25)
+            self.wait(entered.is_set)
+            self.assertTrue(self.app._models_pending)
+            self.assertIn("모델 확인 중", self.app.loading_text.get())
+            self.assertEqual(str(self.app.progress["mode"]), "indeterminate")
+            self.assertEqual(self.app.models_button["text"], "모델 확인 중지")
+            initial_progress = float(self.app.progress["value"])
+            heartbeat = []
+            self.app.after(30, lambda: heartbeat.append(True))
+            self.wait(lambda: bool(heartbeat), timeout=.5)
+            self.wait(lambda: float(self.app.progress["value"]) > initial_progress, timeout=.5)
+            started = time.monotonic()
+            self.app.models_button.invoke()
+            self.assertLess(time.monotonic() - started, .25)
+            self.assertTrue(self.app._model_cancel.is_set())
+            self.assertEqual(str(self.app.models_button["state"]), "disabled")
+            self.wait(lambda: not self.app._models_pending)
+        self.assertEqual(str(self.app.models_button["state"]), "normal")
+        self.assertEqual(str(self.app.progress["mode"]), "determinate")
+        self.assertEqual(self.app.loading_text.get(), "")
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+
+    def test_cancelled_lookup_does_not_apply_a_result_already_waiting_in_queue(self):
+        original = self.app.model.get()
+        replacement = next(iter(NVIDIA_DISCOVERABLE))
+        result = ModelDiscovery([replacement], [], [replacement], [])
+        with patch("frametag.ui.discover_photo_models", return_value=result):
+            self.app._fetch_models()
+            deadline = time.monotonic() + 1
+            while True:
+                with self.app.events.mutex:
+                    queued = any(name == "models" for name, _ in self.app.events.queue)
+                if queued or time.monotonic() >= deadline:
+                    break
+                time.sleep(.005)
+            self.assertTrue(queued)
+            self.app._fetch_models()  # Cancel before Tk consumes the ready result.
+            self.wait(lambda: not self.app._models_pending)
+        self.assertEqual(self.app.model.get(), original)
+        self.assertFalse(self.app._verified_models.get(("NVIDIA", self.app.api_key.get())))
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertIn("중지", self.app.status.get())
+
+    def test_model_retirement_during_real_analysis_clears_and_persists_selection(self):
+        retired = next(iter(NVIDIA_DISCOVERABLE))
+        self._verify_model_for_test(retired)
+        class RetiredAnalyzer:
+            def analyze(_self, path, cancel):
+                raise APIError("The selected model has reached its end of life", fatal=True,
+                               status_code=410, model_retired=retired)
+        with patch.object(self.app.engine, "_factory", return_value=RetiredAnalyzer()):
+            self.app._analyze()
+            self.wait(lambda: self.app.model.get() == "" and not self.app._busy)
+        self.app._save_settings()
+        self.assertIn(retired, self.settings.load()["retired_nvidia_models"])
+        self.assertNotIn(retired, self.app._verified_models[("NVIDIA", self.app.api_key.get())])
+        self.assertTrue(all(photo.path.exists() for photo in self.app.photos))
+        self.assertEqual(sum(photo.status == "오류" for photo in self.app.photos), 1)
+        self.assertEqual(sum(photo.status == "대기" for photo in self.app.photos), 2)
+        self.assertTrue(self.errors)
 
     def test_api_diagnostic_uses_new_key_and_gui_animates_while_server_waits(self):
         entered, release = threading.Event(), threading.Event()
@@ -258,18 +471,19 @@ class UITests(unittest.TestCase):
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
         original_model = self.app.model.get()
-        def lookup(provider, key):
+        available = list(NVIDIA_DISCOVERABLE)[:1]
+        def lookup(provider, key, preferred, cancel, **kwargs):
             entered.set()
             release.wait(2)
-            return [DEFAULT_MODELS["NVIDIA"][1]]
-        with patch("frametag.ui.list_models", side_effect=lookup):
+            return ModelDiscovery(available, [], available, [])
+        with patch("frametag.ui.discover_photo_models", side_effect=lookup):
             self.app._fetch_models()
             self.wait(entered.is_set)
             self.app.api_key.set("mock-changed-during-discovery")
             release.set()
             self.wait(lambda: not self.app._models_pending)
         self.assertEqual(self.app.model.get(), original_model)
-        self.assertIn("이전 모델 조회 결과", self.app.status.get())
+        self.assertIn("중지", self.app.status.get())
         self.assertFalse(self.errors)
 
     def test_diagnostic_identifies_result_from_settings_changed_during_request(self):
@@ -441,6 +655,7 @@ class UITests(unittest.TestCase):
             Cache(self.folder).put(Photo.from_path(path))
         self.app = self._new_app()
         self.wait(lambda: len(self.app.photos) == 8 and not self.app._loading)
+        self._verify_model_for_test()
         self.assertEqual(len(self.app.tree.get_children()), 3)
         self.assertIn("완료 5장 숨김", self.app.count.get())
         self.app._analyze()

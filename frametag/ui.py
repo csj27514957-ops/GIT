@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import queue
+import re
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -13,9 +14,10 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from . import __version__
-from .api import APIError, Cancelled, DEFAULT_MODELS, diagnose_connection, list_models
+from .api import (APIError, Cancelled, ModelDiscovery,
+                  diagnose_connection, discover_photo_models, list_models)
 from .domain import is_gender_prefixed_filename, select_through
-from .model_catalog import model_id, model_label, restore_model
+from .model_catalog import DEFAULT_MODELS, RETIRED_NVIDIA_MODELS, model_id, model_label, restore_model
 from .engine import Engine
 from .models import Photo
 from .storage import KeyStore, SettingsStore
@@ -43,6 +45,10 @@ class FrameTagApp(tk.Tk):
         self._diagnostic_cancel = threading.Event()
         self._api_revision = 0
         self._models_pending = False
+        self._model_cancel = threading.Event()
+        self._resume_auto_after_models = False
+        self._resume_model_after_models = ""
+        self._verified_models = {}
         self._loaded_folder = None
         self._closed = False
         self._tray = None
@@ -68,12 +74,19 @@ class FrameTagApp(tk.Tk):
             saved = {}
         self._saved = saved
         self._models = saved.get("models", {}) if isinstance(saved.get("models"), dict) else {}
+        retired = saved.get("retired_nvidia_models", [])
+        self._retired_nvidia = set(RETIRED_NVIDIA_MODELS)
+        if isinstance(retired, list):
+            self._retired_nvidia.update(item for item in retired if isinstance(item, str)
+                and re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", item))
         provider = saved.get("provider", "NVIDIA")
         if provider not in ("NVIDIA", "OpenAI"):
             provider = "NVIDIA"
         self.folder = tk.StringVar(value=saved.get("folder", ""))
         self.provider = tk.StringVar(value=provider)
         self.model = tk.StringVar(value=restore_model(provider, self._models.get(provider, "")))
+        if provider == "NVIDIA" and self.model.get() in self._retired_nvidia:
+            self.model.set("")
         self.model_choice = tk.StringVar(value=model_label(provider, self.model.get()))
         self.api_key = tk.StringVar()
         self.recursive = tk.BooleanVar(value=bool(saved.get("recursive", False)))
@@ -115,10 +128,20 @@ class FrameTagApp(tk.Tk):
 
     def _model_changed(self, *args):
         self._api_revision += 1
+        self._pause_for_api_change()
         label = model_label(self.provider.get(), self.model.get())
         if self.model_choice.get() != label:
             self.model_choice.set(label)
         self._schedule_save()
+
+    def _pause_for_api_change(self):
+        if self._models_pending:
+            self._model_cancel.set()
+            self._resume_auto_after_models = False
+        if self._busy or self.auto_watch.get():
+            self.auto_watch.set(False)
+            self._dispatch_engine(self.engine.stop_analysis)
+            self.status.set("API 설정이 바뀌어 분석을 중지했습니다. 새 설정의 모델을 확인한 뒤 다시 시작하세요.")
 
     def _model_choice_changed(self, *args):
         identifier = model_id(self.provider.get(), self.model_choice.get())
@@ -141,9 +164,10 @@ class FrameTagApp(tk.Tk):
         self._engine_pool.submit(run)
 
     def _update_loading_indicator(self):
-        active = self._loading or self._auto_pending or self._diagnosing
+        active = self._loading or self._auto_pending or self._diagnosing or self._models_pending
         self.loading_text.set("로딩 중 · 사진 목록과 저장된 결과를 불러오고 있습니다." if self._loading else
                               "처리 중 · 자동 감시 설정을 적용하고 있습니다." if self._auto_pending else
+                              "모델 확인 중 · 서버 응답을 기다리고 있습니다." if self._models_pending else
                               "API 연결 진단 중 · 서버 응답을 기다리고 있습니다." if self._diagnosing else "")
         if active and str(self.progress["mode"]) != "indeterminate":
             self.progress.configure(mode="indeterminate")
@@ -335,7 +359,9 @@ class FrameTagApp(tk.Tk):
         self._configure_engine()
         self._models[self.provider.get()] = self.model.get().strip()
         data = dict(folder=self.folder.get().strip(), recursive=self.recursive.get(),
-                    provider=self.provider.get(), models=self._models, auto_watch=self.auto_watch.get(),
+                    provider=self.provider.get(), models=self._models,
+                    auto_watch=self.auto_watch.get() or self._resume_auto_after_models,
+                    retired_nvidia_models=sorted(self._retired_nvidia),
                     close_to_tray=self.close_to_tray.get(), show_completed=self.show_completed.get(),
                     geometry=self.geometry(), sash=self.pane.sashpos(0))
         try:
@@ -375,6 +401,7 @@ class FrameTagApp(tk.Tk):
             return
         self._key_dirty = True
         self._api_revision += 1
+        self._pause_for_api_change()
         self._provider_keys[self._active_provider] = self.api_key.get().strip()
         if self._key_save_id:
             self.after_cancel(self._key_save_id)
@@ -410,6 +437,8 @@ class FrameTagApp(tk.Tk):
         self._models[self._active_provider] = self.model.get().strip()
         self._active_provider = self.provider.get()
         self.model.set(restore_model(self._active_provider, self._models.get(self._active_provider, "")))
+        if self._active_provider == "NVIDIA" and self.model.get() in self._retired_nvidia:
+            self.model.set("")
         self.model_combo.configure(values=[model_label(self._active_provider, identifier)
                                           for identifier in self._defaults(self._active_provider)])
         self._load_key(self._active_provider)
@@ -419,32 +448,72 @@ class FrameTagApp(tk.Tk):
     def _configure_engine(self):
         self._dispatch_engine(self.engine.configure, self.provider.get(), self.model.get().strip(), self.api_key.get().strip())
 
-    def _fetch_models(self):
+    def _fetch_models(self, *, resume_auto=False):
         if self._models_pending:
+            self._model_cancel.set()
+            self._resume_auto_after_models = False
+            self.models_button.configure(state="disabled", text="확인 중지 중…")
             return
         provider, key = self.provider.get(), self.api_key.get().strip()
         if not key:
             messagebox.showinfo("모델 목록", "선택한 공급자의 API 키를 먼저 입력하세요.", parent=self)
             return
         revision = self._api_revision
+        preferred = self.model.get().strip()
+        excluded = tuple(self._retired_nvidia)
+        self._pause_for_api_change()
+        self._verified_models.pop((provider, key), None)
         self._models_pending = True
-        self.models_button.configure(state="disabled", text="모델 확인 중…")
-        self.status.set("계정에서 사용할 수 있는 API 모델 목록을 가져오는 중입니다.")
+        self._model_cancel = threading.Event()
+        cancel = self._model_cancel
+        self._resume_auto_after_models = resume_auto
+        self._resume_model_after_models = preferred
+        self.models_button.configure(state="normal", text="모델 확인 중지")
+        self._update_loading_indicator()
+        self.status.set("계정 목록의 사진 후보를 작은 합성 이미지로 확인합니다. 소량의 API 사용량이 발생할 수 있습니다.")
+        def progress(number, total, identifier):
+            self.events.put(("model_progress", (revision, f"모델 확인 중 · {number}/{total}: {identifier}")))
         def fetch():
             try:
-                self.events.put(("models", (revision, provider, list_models(provider, key))))
+                if provider == "NVIDIA":
+                    result = discover_photo_models(provider, key, preferred, cancel,
+                                                   excluded=excluded, progress=progress)
+                else:
+                    result = ModelDiscovery(list_models(provider, key, cancel), [], [], [])
+                self.events.put(("models", (revision, provider, key, result)))
+            except Cancelled:
+                self.events.put(("models_cancelled", None))
             except APIError as exc:
-                self.events.put(("models_error", (revision, str(exc))))
+                self.events.put(("models_error", (revision, str(exc), exc.retired_models)))
             except Exception:
-                self.events.put(("models_error", (revision, "모델 목록을 가져오지 못했습니다. API 설정과 연결을 확인하세요.")))
+                self.events.put(("models_error", (revision, "모델 목록을 가져오지 못했습니다. API 설정과 연결을 확인하세요.", [])))
         threading.Thread(target=fetch, daemon=True, name="model-list").start()
+
+    def _finish_model_lookup(self):
+        self._models_pending = False
+        self.models_button.configure(state="normal", text="사용 가능한 모델 확인")
+        self._update_loading_indicator()
+
+    def _record_retired_models(self, identifiers):
+        self._retired_nvidia.update(identifier for identifier in identifiers
+                                    if isinstance(identifier, str)
+                                    and re.fullmatch(r"[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+", identifier))
+        for (provider, key), verified in self._verified_models.items():
+            if provider == "NVIDIA":
+                verified.difference_update(self._retired_nvidia)
+        if self.provider.get() == "NVIDIA":
+            if self.model.get() in self._retired_nvidia:
+                self.model.set("")
+            self.model_combo.configure(values=[model_label("NVIDIA", identifier) for identifier in
+                sorted(self._verified_models.get(("NVIDIA", self.api_key.get().strip()), set()))])
+        self._schedule_save()
 
     def _diagnose_api(self):
         if self._diagnosing:
             return
         provider, model, key = self.provider.get(), self.model.get().strip(), self.api_key.get().strip()
-        if not key or not model:
-            messagebox.showinfo("API 연결 진단", "API 키와 모델을 먼저 입력하세요.", parent=self)
+        if not key:
+            messagebox.showinfo("API 연결 진단", "API 키를 먼저 입력하세요.", parent=self)
             return
         revision = self._api_revision
         self._diagnosing = True
@@ -545,8 +614,17 @@ class FrameTagApp(tk.Tk):
         if not self._folder_matches():
             messagebox.showinfo("사진 폴더", "입력한 폴더의 사진 목록을 먼저 불러오세요.", parent=self)
             return False
-        if not self.api_key.get().strip() or not self.model.get().strip():
-            messagebox.showinfo("AI 설정", "API 키와 API 모델 ID를 입력하세요.", parent=self)
+        provider, key, identifier = self.provider.get(), self.api_key.get().strip(), self.model.get().strip()
+        if not key:
+            messagebox.showinfo("AI 설정", "API 키를 입력하세요.", parent=self)
+            return False
+        if provider == "NVIDIA" and identifier not in self._verified_models.get((provider, key), set()):
+            self.status.set("현재 키로 사진 입력을 확인한 모델을 먼저 선택하세요.")
+            if not self._models_pending:
+                self._fetch_models()
+            return False
+        if not identifier:
+            messagebox.showinfo("AI 설정", "API 모델 ID를 입력하세요.", parent=self)
             return False
         return True
 
@@ -912,6 +990,10 @@ class FrameTagApp(tk.Tk):
             elif name == "auto":
                 self.auto_watch.set(bool(data))
                 self._schedule_save()
+            elif name == "model_retired":
+                provider, identifier = data
+                if provider == "NVIDIA":
+                    self._record_retired_models([identifier])
             elif name == "error":
                 self.status.set(data)
                 if self.state() != "withdrawn":
@@ -922,7 +1004,9 @@ class FrameTagApp(tk.Tk):
                 self._loaded_folder = path.resolve()
                 self.folder.set(str(path.resolve()))
                 self._update_buttons()
-                if resume_auto and self._ready():
+                if resume_auto and self.provider.get() == "NVIDIA":
+                    self._fetch_models(resume_auto=True)
+                elif resume_auto and self._ready():
                     self._configure_engine()
                     self._dispatch_engine(self.engine.set_auto, True)
                     self.auto_watch.set(True)
@@ -932,22 +1016,51 @@ class FrameTagApp(tk.Tk):
                 self._update_buttons()
                 self.status.set(data)
             elif name == "models":
-                revision, provider, models = data
-                self._models_pending = False
-                self.models_button.configure(state="normal", text="사용 가능한 모델 확인")
-                if revision == self._api_revision and provider == self.provider.get():
+                revision, provider, key, result = data
+                models = result.models
+                resume_auto = self._resume_auto_after_models
+                resume_model = self._resume_model_after_models
+                self._resume_auto_after_models = False
+                self._finish_model_lookup()
+                if self._model_cancel.is_set():
+                    self.status.set("모델 확인을 중지했습니다.")
+                elif revision == self._api_revision and provider == self.provider.get():
+                    if provider == "NVIDIA":
+                        self._record_retired_models(result.retired)
+                        models = [identifier for identifier in models if identifier not in self._retired_nvidia]
+                        self._verified_models[(provider, key)] = set(models)
                     self.model_combo.configure(values=[model_label(provider, identifier) for identifier in models])
-                    if models and self.model.get() not in models:
-                        self.model.set(models[0])
-                    self.status.set(f"계정 목록에서 사진 분석 후보 {len(models)}개를 확인했습니다." if models else
-                                    "계정 목록에 추천 사진 모델이 없습니다. NVIDIA 계정의 모델 권한을 확인하세요.")
+                    if self.model.get() not in models:
+                        self.model.set(models[0] if models else "")
+                    self.status.set(f"사진 입력 확인을 통과한 모델 {len(models)}개를 표시합니다." if provider == "NVIDIA" and models else
+                                    f"API 모델 {len(models)}개를 확인했습니다." if models else
+                                    "사진 입력 확인을 통과한 후보가 없습니다. API 연결 진단 결과에서 전체 모델 목록을 확인하세요.")
+                    if result.notes:
+                        self.status.set(self.status.get() + " " + " / ".join(result.notes[:2]))
+                    if resume_auto and resume_model and self.model.get() == resume_model and models and self._ready():
+                        self._configure_engine()
+                        self._dispatch_engine(self.engine.set_auto, True)
+                        self.auto_watch.set(True)
+                    elif resume_auto:
+                        self.status.set(self.status.get() + " 기존 모델을 확인하지 못해 자동 감시는 중지 상태입니다.")
+                    self._save_settings()
                 else:
                     self.status.set("설정이 바뀌어 이전 모델 조회 결과를 적용하지 않았습니다. 다시 확인하세요.")
-            elif name == "models_error":
+            elif name == "model_progress":
                 revision, message = data
-                self._models_pending = False
-                self.models_button.configure(state="normal", text="사용 가능한 모델 확인")
-                if revision == self._api_revision:
+                if self._models_pending and revision == self._api_revision:
+                    self.status.set(message)
+                    self.loading_text.set(message)
+            elif name == "models_cancelled":
+                self._resume_auto_after_models = False
+                self._finish_model_lookup()
+                self.status.set("모델 확인을 중지했습니다.")
+            elif name == "models_error":
+                revision, message, retired = data
+                self._resume_auto_after_models = False
+                self._finish_model_lookup()
+                if revision == self._api_revision and not self._model_cancel.is_set():
+                    self._record_retired_models(retired)
                     self.status.set(message)
                     messagebox.showerror("모델 목록", message, parent=self)
             elif name == "diagnostic":
@@ -1029,6 +1142,7 @@ class FrameTagApp(tk.Tk):
         self._closed = True
         self._engine_pool.shutdown(wait=False, cancel_futures=True)
         self._diagnostic_cancel.set()
+        self._model_cancel.set()
         self.progress.stop()
         for after_id in (self._poll_id, self._save_id, self._search_id, self._preview_id, self._key_save_id):
             if after_id:

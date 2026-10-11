@@ -458,6 +458,12 @@ class Engine:
                     self._mark(photo, "error")
                     self._publish()
                 self._consecutive_failures += 1
+                # Only the current request's explicit model retirement belongs
+                # in persistent UI settings. Generic 410s and earlier API
+                # configurations must not exclude a model for future runs.
+                if (isinstance(exc, APIError) and config[1]
+                        and getattr(exc, "model_retired", None) == config[1]):
+                    self._emit("model_retired", (config[0], config[1]))
                 fatal = bool(getattr(exc, "fatal", False))
                 if fatal or self._consecutive_failures >= 3:
                     self._pause_for_failure(str(exc) if fatal else "3장 연속 오류로 분석을 중지했습니다. " + str(exc))
