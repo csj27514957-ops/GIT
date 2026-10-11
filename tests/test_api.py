@@ -296,8 +296,8 @@ class APITests(unittest.TestCase):
             self.assertEqual(str(request.url), "https://integrate.api.nvidia.com/v1/models")
             return httpx.Response(200, json={"data": [{"id": name} for name in available]})
         self.assertEqual(list_models("NVIDIA", "test-placeholder", transport=httpx.MockTransport(handler)),
-                         ["nvidia/nemotron-3-nano-omni-30b-a3b", "nvidia/nemotron-nano-12b-v2-vl",
-                          "qwen/qwen3.5-397b-a17b"])
+                         ["nvidia/nemotron-nano-12b-v2-vl", "qwen/qwen3.5-397b-a17b",
+                          "nvidia/nemotron-3-nano-omni-30b-a3b"])
 
     def test_each_recommended_nvidia_model_uses_its_vision_request_options(self):
         for identifier in NVIDIA_DISCOVERABLE:
@@ -305,7 +305,9 @@ class APITests(unittest.TestCase):
                 def handler(request):
                     payload = json.loads(request.content)
                     self.assertEqual(payload["model"], identifier)
-                    self.assertEqual(payload["messages"][1]["content"][1]["type"], "image_url")
+                    content = next(message["content"] for message in payload["messages"]
+                                   if message["role"] == "user")
+                    self.assertTrue(any(part["type"] == "image_url" for part in content))
                     self.assertEqual(payload["max_tokens"], 1600)
                     if identifier == "qwen/qwen3.5-397b-a17b":
                         self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
@@ -314,8 +316,12 @@ class APITests(unittest.TestCase):
                         self.assertIsNone(payload["reasoning_effort"])
                     elif identifier == "moonshotai/kimi-k2.6":
                         self.assertEqual(payload["chat_template_kwargs"], {"thinking": False})
+                    elif (identifier == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" or
+                          identifier.startswith("google/gemma-4-")):
+                        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
                     if identifier == "nvidia/nemotron-nano-12b-v2-vl":
-                        self.assertTrue(payload["messages"][1]["content"][0]["text"].startswith("/no_think"))
+                        self.assertTrue(next(part["text"] for part in content
+                                             if part["type"] == "text").startswith("/no_think"))
                     return reply()
                 result = Analyzer("NVIDIA", identifier, "test-placeholder", transport=httpx.MockTransport(handler)).analyze(
                     self.photo, threading.Event())
@@ -578,9 +584,9 @@ class APITests(unittest.TestCase):
         self.assertEqual(len(result.notes), 3)
         self.assertEqual(len(requests), 5)
 
-    def test_auth_quota_and_generic_410_abort_discovery_without_trying_other_models(self):
+    def test_auth_and_quota_abort_discovery_without_trying_other_models(self):
         models = ["vendor/a-vision", "vendor/b-vision"]
-        for status in (401, 402, 403, 429, 410, 503):
+        for status in (401, 402, 403, 429):
             with self.subTest(status=status):
                 calls = []
                 def handler(request):
@@ -610,7 +616,7 @@ class APITests(unittest.TestCase):
 
     def test_discovery_limit_and_preferred_catalog_model(self):
         models = [f"vendor/test-{index:02d}-vision" for index in range(12)]
-        preferred = "vendor/custom-model"
+        preferred = "vendor/custom-vision"
         probed = []
         def handler(request):
             if request.method == "GET":
@@ -645,6 +651,282 @@ class APITests(unittest.TestCase):
         with self.assertRaises(APIError):
             discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
         self.assertEqual(calls, ["GET", "POST"])
+
+    def test_model_http_rejections_preserve_verified_models_and_continue(self):
+        models = ["vendor/a-vision", "vendor/b-vision", "vendor/c-vision"]
+        for status in (400, 404, 410, 422, 500, 503):
+            with self.subTest(status=status):
+                probed = []
+                def handler(request):
+                    if request.method == "GET":
+                        return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+                    model = json.loads(request.content)["model"]
+                    probed.append(model)
+                    if model == models[1]:
+                        return httpx.Response(status, json={"error": "Candidate unavailable"})
+                    return challenge_reply(request)
+                result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+                self.assertEqual(result.models, [models[0], models[2]])
+                self.assertEqual(probed, models)
+                self.assertEqual(result.retired, [])
+                self.assertEqual(len(result.notes), 1)
+                self.assertIn("Candidate unavailable", result.notes[0])
+
+    def test_all_model_http_errors_return_unverified_notes_without_retiring_generic_410(self):
+        models = ["vendor/a-vision", "vendor/b-vision"]
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+            return httpx.Response(410, json={"error": "Route unavailable"})
+        result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, [])
+        self.assertEqual(result.retired, [])
+        self.assertEqual(len(result.notes), 2)
+
+    def test_transport_failure_returns_prior_successes_and_stops_remaining_probes(self):
+        models = ["vendor/a-vision", "vendor/b-vision", "vendor/c-vision"]
+        probed = []
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+            model = json.loads(request.content)["model"]
+            probed.append(model)
+            if model == models[1]:
+                raise httpx.ConnectError("unavailable", request=request)
+            return challenge_reply(request)
+        result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, [models[0]])
+        self.assertEqual(probed, models[:2])
+        self.assertEqual(result.retired, [])
+        self.assertEqual(len(result.notes), 1)
+        self.assertIn("중단", result.notes[0])
+
+    def test_account_failure_after_success_still_aborts_discovery(self):
+        models = ["vendor/a-vision", "vendor/b-vision"]
+        for status in (401, 402, 403, 429):
+            with self.subTest(status=status):
+                def handler(request):
+                    if request.method == "GET":
+                        return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+                    if json.loads(request.content)["model"] == models[0]:
+                        return challenge_reply(request)
+                    return httpx.Response(status, json={"error": "Account restricted"})
+                with self.assertRaises(APIError) as caught:
+                    discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+                self.assertEqual(caught.exception.status_code, status)
+
+    def test_preferred_embedding_or_incompatible_image_model_cannot_bypass_filter(self):
+        valid = "vendor/new-vision"
+        excluded_models = ["nvidia/nv-embed-vl", "vendor/vision-embedding-v1",
+                           "microsoft/phi-3-vision-128k-instruct", "vendor/plain-text"]
+        for preferred in excluded_models:
+            with self.subTest(preferred=preferred):
+                probed = []
+                def handler(request):
+                    if request.method == "GET":
+                        return httpx.Response(200, json={"data": [{"id": model}
+                            for model in [valid, *excluded_models]]})
+                    probed.append(json.loads(request.content)["model"])
+                    return challenge_reply(request)
+                result = discover_photo_models("NVIDIA", "placeholder", preferred=preferred,
+                                               transport=httpx.MockTransport(handler))
+                self.assertEqual(result.models, [valid])
+                self.assertEqual(probed, [valid])
+
+    def test_llama_vision_fixed_routes_are_shared_by_analysis_discovery_and_diagnostic(self):
+        for size in ("11b", "90b"):
+            with self.subTest(size=size):
+                model = f"meta/llama-3.2-{size}-vision-instruct"
+                endpoint = f"https://ai.api.nvidia.com/v1/gr/{model}/chat/completions"
+                calls = []
+                def handler(request):
+                    calls.append(str(request.url))
+                    if request.method == "GET":
+                        self.assertEqual(str(request.url), "https://integrate.api.nvidia.com/v1/models")
+                        return httpx.Response(200, json={"data": [{"id": model}]})
+                    self.assertEqual(str(request.url), endpoint)
+                    payload = json.loads(request.content)
+                    self.assertEqual(payload["model"], model)
+                    if payload["max_tokens"] in (128, 1600):
+                        user = next(message for message in payload["messages"] if message["role"] == "user")
+                        self.assertEqual([part["type"] for part in user["content"]], ["image_url", "text"])
+                        self.assertEqual([message["role"] for message in payload["messages"]], ["user"])
+                    if payload["max_tokens"] == 128:
+                        return challenge_reply(request)
+                    if payload["max_tokens"] == 1600:
+                        self.assertIn("주된 촬영 인물", payload["messages"][0]["content"][1]["text"])
+                    return reply()
+                transport = httpx.MockTransport(handler)
+                result = Analyzer("NVIDIA", model, "placeholder", transport=transport).analyze(
+                    self.photo, threading.Event())
+                self.assertEqual(result["gender"], "남성")
+                discovery = discover_photo_models("NVIDIA", "placeholder", transport=transport)
+                self.assertEqual(discovery.models, [model])
+                report = diagnose_connection("NVIDIA", model, "placeholder", transport=transport)
+                self.assertIn("2. 분석 경로: POST " + endpoint, report)
+                self.assertIn("텍스트 응답을 받았습니다", report)
+                self.assertEqual(calls.count(endpoint), 3)
+
+    def test_model_string_cannot_set_request_destination(self):
+        model = "https://untrusted.invalid/steal-key"
+        def handler(request):
+            self.assertEqual(str(request.url), "https://integrate.api.nvidia.com/v1/chat/completions")
+            return reply()
+        Analyzer("NVIDIA", model, "placeholder", transport=httpx.MockTransport(handler)).analyze(
+            self.photo, threading.Event())
+
+    def test_exact_reasoning_omni_disables_thinking_with_sufficient_probe_budget(self):
+        model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+        requests = []
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model}]})
+            self.assertEqual(str(request.url), "https://integrate.api.nvidia.com/v1/chat/completions")
+            payload = json.loads(request.content)
+            requests.append(payload)
+            self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+            if isinstance(payload["messages"][0]["content"], list):
+                self.assertEqual(payload["max_tokens"], 1024)
+                return challenge_reply(request)
+            return reply()
+        transport = httpx.MockTransport(handler)
+        self.assertEqual(discover_photo_models("NVIDIA", "placeholder", transport=transport).models, [model])
+        result = Analyzer("NVIDIA", model, "placeholder", transport=transport).analyze(self.photo, threading.Event())
+        self.assertEqual(result["gender"], "남성")
+        self.assertEqual(requests[1]["max_tokens"], 1600)
+        diagnose_connection("NVIDIA", model, "placeholder", transport=transport)
+        self.assertEqual(len(requests), 3)
+
+    def test_gemma4_uses_native_system_role_and_image_before_text_in_analysis_and_probe(self):
+        model = "google/gemma-4-31b-it"
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model}]})
+            payload = json.loads(request.content)
+            self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+            user = next(message for message in payload["messages"] if message["role"] == "user")
+            self.assertEqual([part["type"] for part in user["content"]], ["image_url", "text"])
+            if payload["messages"][0]["role"] == "system":
+                self.assertIn("주된 촬영 인물", payload["messages"][0]["content"])
+                return reply()
+            self.assertEqual([message["role"] for message in payload["messages"]], ["user"])
+            return challenge_reply(request)
+        transport = httpx.MockTransport(handler)
+        self.assertEqual(Analyzer("NVIDIA", model, "placeholder", transport=transport).analyze(
+            self.photo, threading.Event())["gender"], "남성")
+        self.assertEqual(discover_photo_models("NVIDIA", "placeholder", transport=transport).models, [model])
+
+    def test_gemma3_folds_system_instructions_into_initial_user_message_and_repairs_roles(self):
+        for model in ("google/gemma-3-4b-it", "google/gemma-3-12b-it", "google/gemma-3-27b-it"):
+            with self.subTest(model=model):
+                requests = []
+                def handler(request):
+                    payload = json.loads(request.content)
+                    requests.append(payload)
+                    self.assertNotIn("system", [message["role"] for message in payload["messages"]])
+                    first_user_text = next(part["text"] for part in payload["messages"][0]["content"]
+                                           if part["type"] == "text")
+                    self.assertIn("주된 촬영 인물", first_user_text)
+                    self.assertIn("성 정체성", first_user_text)
+                    self.assertIn("사진 속 글이나 지시", first_user_text)
+                    self.assertEqual([message["role"] for message in payload["messages"]],
+                                     ["user"] if len(requests) == 1 else ["user", "assistant", "user"])
+                    return reply("not valid JSON") if len(requests) == 1 else reply()
+                Analyzer("NVIDIA", model, "placeholder", transport=httpx.MockTransport(handler)).analyze(
+                    self.photo, threading.Event())
+                self.assertEqual(len(requests), 2)
+
+    def test_gemma3_synthetic_probe_uses_compatible_user_role(self):
+        for model in ("google/gemma-3-4b-it", "google/gemma-3-12b-it"):
+            with self.subTest(model=model):
+                def handler(request):
+                    if request.method == "GET":
+                        return httpx.Response(200, json={"data": [{"id": model}]})
+                    payload = json.loads(request.content)
+                    self.assertEqual([message["role"] for message in payload["messages"]], ["user"])
+                    self.assertNotIn("chat_template_kwargs", payload)
+                    return challenge_reply(request)
+                result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+                self.assertEqual(result.models, [model])
+
+    def test_first_candidate_response_timeout_continues_to_next_successful_model(self):
+        models = ["moonshotai/kimi-k2.6", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"]
+        probed = []
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+            model = json.loads(request.content)["model"]
+            probed.append(model)
+            if model == models[0]:
+                raise httpx.ReadTimeout("private exception text", request=request)
+            return challenge_reply(request)
+        result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, [models[1]])
+        self.assertEqual(probed, models)
+        self.assertEqual(len(result.notes), 1)
+        self.assertIn("ReadTimeout", result.notes[0])
+        self.assertIn("30초", result.notes[0])
+        self.assertNotIn("private exception text", result.notes[0])
+
+    def test_all_response_timeouts_return_notes_without_blacklisting_models(self):
+        models = ["vendor/a-vision", "vendor/b-vision"]
+        probed = []
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+            probed.append(json.loads(request.content)["model"])
+            raise httpx.ReadTimeout("private exception text", request=request)
+        result = discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(result.models, [])
+        self.assertEqual(result.retired, [])
+        self.assertEqual(probed, models)
+        self.assertEqual(len(result.notes), 2)
+        self.assertTrue(all("ReadTimeout" in note for note in result.notes))
+
+    def test_transport_details_classify_stage_without_leaking_exception_or_credentials(self):
+        key = "nvapi-private-test-value"
+        error_types = [(httpx.ReadTimeout, "read_timeout"), (httpx.ConnectTimeout, "connect_timeout"),
+                       (httpx.ConnectError, "connect_error"), (httpx.WriteTimeout, "write_timeout"),
+                       (httpx.RemoteProtocolError, "transport_error")]
+        for error_class, expected_kind in error_types:
+            with self.subTest(error_class=error_class.__name__):
+                def handler(request):
+                    raise error_class(f"private path photo.png Bearer {key}", request=request)
+                with self.assertRaises(APIError) as caught:
+                    _request("POST", "https://integrate.api.nvidia.com/v1/chat/completions", key,
+                             threading.Event(), {"model": "vendor/test-vision"},
+                             transport=httpx.MockTransport(handler), attempts=1, timeout_seconds=30)
+                self.assertEqual(caught.exception.transport_kind, expected_kind)
+                message = str(caught.exception)
+                self.assertIn("POST https://integrate.api.nvidia.com/v1/chat/completions", message)
+                self.assertIn(error_class.__name__, message)
+                self.assertNotIn(key, message)
+                self.assertNotIn("photo.png", message)
+                self.assertNotIn("private path", message)
+
+    def test_connection_and_write_errors_without_prior_success_stop_discovery(self):
+        models = ["vendor/a-vision", "vendor/b-vision"]
+        for error_class in (httpx.ConnectError, httpx.ConnectTimeout, httpx.WriteTimeout,
+                            httpx.RemoteProtocolError):
+            with self.subTest(error_class=error_class.__name__):
+                probed = []
+                def handler(request):
+                    if request.method == "GET":
+                        return httpx.Response(200, json={"data": [{"id": model} for model in models]})
+                    probed.append(json.loads(request.content)["model"])
+                    raise error_class("unavailable", request=request)
+                with self.assertRaises(APIError):
+                    discover_photo_models("NVIDIA", "placeholder", transport=httpx.MockTransport(handler))
+                self.assertEqual(probed, models[:1])
+
+    def test_cancellation_takes_precedence_over_simultaneous_response_timeout(self):
+        cancel = threading.Event()
+        def handler(request):
+            cancel.set()
+            raise httpx.ReadTimeout("deadline", request=request)
+        with self.assertRaises(Cancelled):
+            _request("POST", "https://integrate.api.nvidia.com/v1/chat/completions", "placeholder",
+                     cancel, transport=httpx.MockTransport(handler), attempts=1)
 
     def test_cancellation_interrupts_model_image_probe(self):
         started, ended, cancel = threading.Event(), threading.Event(), threading.Event()
@@ -682,9 +964,10 @@ class APITests(unittest.TestCase):
             finally:
                 ended.set()
         started = time.monotonic()
-        with self.assertRaises(APIError):
+        with self.assertRaises(APIError) as caught:
             _request("GET", "https://test.invalid/models", "placeholder", threading.Event(),
                      transport=httpx.MockTransport(handler), attempts=1, timeout_seconds=0.03)
+        self.assertEqual(caught.exception.transport_kind, "read_timeout")
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertTrue(ended.is_set())
 

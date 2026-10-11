@@ -283,6 +283,135 @@ class UITests(unittest.TestCase):
         self.assertEqual(FakeAnalyzer.calls, [])
         self.assertFalse(self.errors)
 
+    def test_partial_model_verification_report_retains_later_failures_and_redacts_key(self):
+        available = list(NVIDIA_DISCOVERABLE)[:3]
+        key = self.app.api_key.get()
+        notes = ["첫 번째 후보의 이미지 입력을 확인하지 못했습니다.",
+                 "두 번째 후보의 테스트 색상 확인이 실패했습니다.",
+                 f"마지막 후보 오류: unsupported image input; credential={key}"]
+        result = ModelDiscovery([available[0]], [], available, notes)
+        with patch("frametag.ui.discover_photo_models", return_value=result) as discovery:
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending)
+        dialog = next(widget for widget in self.app.winfo_children()
+                      if widget.winfo_class() == "Toplevel"
+                      and widget.title() == "FrameTag 사진 모델 확인 결과")
+        self.assertFalse(dialog.grab_current())
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        text = next(widget for widget in descendants(dialog) if widget.winfo_class() == "Text")
+        report = text.get("1.0", "end-1c")
+        self.assertIn("공급자: NVIDIA", report)
+        self.assertIn(available[0], report)
+        self.assertIn(notes[0], report)
+        self.assertIn(notes[1], report)
+        self.assertIn("마지막 후보 오류: unsupported image input", report)
+        self.assertIn("[API 키 숨김]", report)
+        self.assertNotIn(key, report)
+        self.assertNotIn(str(self.folder), report)
+        self.assertNotIn("photo1.jpg", report)
+        self.assertNotIn("마지막 후보 오류", self.app.status.get())
+        copy_button = next(widget for widget in descendants(dialog)
+                           if widget.winfo_class() == "TButton"
+                           and widget.cget("text") == "모델 확인 결과 복사")
+        copy_button.invoke()
+        self.assertEqual(self.app.clipboard_get(), report)
+        self.assertEqual(self.app.model.get(), available[0])
+        self.assertEqual(list(self.app.model_combo["values"]), [model_label("NVIDIA", available[0])])
+        self.assertTrue(self.app._ready())
+        self.assertEqual(discovery.call_count, 1)
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+        dialog.destroy()
+
+    def test_empty_model_verification_opens_copyable_report_without_modal_error(self):
+        result = ModelDiscovery([], [], list(NVIDIA_DISCOVERABLE)[:2], [])
+        with patch("frametag.ui.discover_photo_models", return_value=result) as discovery, \
+                patch.object(self.app, "_show_diagnostic") as show:
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending)
+        self.assertEqual(show.call_count, 1)
+        report = show.call_args.args[0]
+        self.assertIn("공급자: NVIDIA", report)
+        self.assertIn("통과한 모델이 없습니다.", report)
+        self.assertEqual(show.call_args.kwargs["title"], "FrameTag 사진 모델 확인 결과")
+        self.assertEqual(show.call_args.kwargs["copy_label"], "모델 확인 결과 복사")
+        self.assertNotIn(self.app.api_key.get(), report)
+        self.assertEqual(self.app.model.get(), "")
+        self.assertEqual(list(self.app.model_combo["values"]), [])
+        self.assertEqual(discovery.call_count, 1)
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+
+    def test_lookup_error_connection_failure_report_has_model_path_and_no_key(self):
+        selected, key = self.app.model.get(), self.app.api_key.get()
+        endpoint = "https://integrate.api.nvidia.com/v1/models"
+        message = ("API 연결에 실패했습니다. 인터넷 연결과 서버 상태를 확인하세요.\n"
+                   f"요청: GET {endpoint}\n연결 오류 종류: ConnectError; credential={key}")
+        with patch("frametag.ui.discover_photo_models", side_effect=APIError(message)) as lookup, \
+                patch.object(self.app, "_show_diagnostic") as show:
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending)
+        self.assertEqual(show.call_count, 1)
+        report = show.call_args.args[0]
+        self.assertIn("통과한 모델이 없습니다.", report)
+        self.assertIn(selected, report)
+        self.assertIn(endpoint, report)
+        self.assertIn("ConnectError", report)
+        self.assertNotIn(key, report)
+        self.assertNotIn(str(self.folder), report)
+        self.assertNotIn("photo1.jpg", report)
+        self.assertEqual(show.call_args.kwargs["copy_label"], "모델 확인 결과 복사")
+        self.assertEqual(lookup.call_count, 1)
+        self.assertFalse(self.app._verified_models.get(("NVIDIA", key)))
+        with patch.object(self.app, "_fetch_models"):
+            self.assertFalse(self.app._ready())
+        self.assertFalse(self.app.auto_watch.get())
+        self.assertFalse(self.app.engine._auto)
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+
+    def test_lookup_error_after_key_change_does_not_open_a_report(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def lookup(*args, **kwargs):
+            entered.set()
+            release.wait(2)
+            raise APIError("이전 키의 API 연결에 실패했습니다.")
+
+        with patch("frametag.ui.discover_photo_models", side_effect=lookup), \
+                patch.object(self.app, "_show_model_verification") as show:
+            self.app._fetch_models()
+            self.wait(entered.is_set)
+            self.app.api_key.set("mock-changed-before-lookup-error")
+            release.set()
+            self.wait(lambda: not self.app._models_pending)
+            show.assert_not_called()
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+
+    def test_lookup_error_cancelled_before_queue_poll_does_not_open_a_report(self):
+        with patch("frametag.ui.discover_photo_models", side_effect=APIError("API 연결에 실패했습니다.")), \
+                patch.object(self.app, "_show_model_verification") as show:
+            self.app._fetch_models()
+            deadline = time.monotonic() + 1
+            while True:
+                with self.app.events.mutex:
+                    queued = any(name == "models_error" for name, _ in self.app.events.queue)
+                if queued or time.monotonic() >= deadline:
+                    break
+                time.sleep(.005)
+            self.assertTrue(queued)
+            self.app._fetch_models()
+            self.wait(lambda: not self.app._models_pending)
+            show.assert_not_called()
+        self.assertEqual(str(self.app.models_button["state"]), "normal")
+        self.assertEqual(FakeAnalyzer.calls, [])
+        self.assertFalse(self.errors)
+
     def test_startup_auto_watch_checks_saved_key_before_enable_and_new_photo_analysis(self):
         saved_key = self.app.api_key.get()
         self.app.auto_watch.set(True)
@@ -396,8 +525,9 @@ class UITests(unittest.TestCase):
     def test_cancelled_lookup_does_not_apply_a_result_already_waiting_in_queue(self):
         original = self.app.model.get()
         replacement = next(iter(NVIDIA_DISCOVERABLE))
-        result = ModelDiscovery([replacement], [], [replacement], [])
-        with patch("frametag.ui.discover_photo_models", return_value=result):
+        result = ModelDiscovery([replacement], [], [replacement], ["취소한 모델 확인의 실패 내용"])
+        with patch("frametag.ui.discover_photo_models", return_value=result), \
+                patch.object(self.app, "_show_model_verification") as show:
             self.app._fetch_models()
             deadline = time.monotonic() + 1
             while True:
@@ -409,6 +539,7 @@ class UITests(unittest.TestCase):
             self.assertTrue(queued)
             self.app._fetch_models()  # Cancel before Tk consumes the ready result.
             self.wait(lambda: not self.app._models_pending)
+            show.assert_not_called()
         self.assertEqual(self.app.model.get(), original)
         self.assertFalse(self.app._verified_models.get(("NVIDIA", self.app.api_key.get())))
         self.assertEqual(FakeAnalyzer.calls, [])
@@ -475,13 +606,15 @@ class UITests(unittest.TestCase):
         def lookup(provider, key, preferred, cancel, **kwargs):
             entered.set()
             release.wait(2)
-            return ModelDiscovery(available, [], available, [])
-        with patch("frametag.ui.discover_photo_models", side_effect=lookup):
+            return ModelDiscovery(available, [], available, ["이전 키의 모델 확인 실패"])
+        with patch("frametag.ui.discover_photo_models", side_effect=lookup), \
+                patch.object(self.app, "_show_model_verification") as show:
             self.app._fetch_models()
             self.wait(entered.is_set)
             self.app.api_key.set("mock-changed-during-discovery")
             release.set()
             self.wait(lambda: not self.app._models_pending)
+            show.assert_not_called()
         self.assertEqual(self.app.model.get(), original_model)
         self.assertIn("중지", self.app.status.get())
         self.assertFalse(self.errors)

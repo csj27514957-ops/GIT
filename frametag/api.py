@@ -28,6 +28,18 @@ ENDPOINTS = {
     "NVIDIA": "https://integrate.api.nvidia.com/v1",
     "OpenAI": "https://api.openai.com/v1",
 }
+# Legacy Llama Vision models use these documented, model-specific NVIDIA routes.
+# Only fixed known IDs can change the destination; no server/user URL is accepted.
+NVIDIA_COMPLETION_ENDPOINTS = {
+    "meta/llama-3.2-11b-vision-instruct":
+        "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-11b-vision-instruct/chat/completions",
+    "meta/llama-3.2-90b-vision-instruct":
+        "https://ai.api.nvidia.com/v1/gr/meta/llama-3.2-90b-vision-instruct/chat/completions",
+}
+VISION_USER_INSTRUCTIONS = {
+    "google/gemma-3-4b-it", "google/gemma-3-12b-it", "google/gemma-3-27b-it",
+    *NVIDIA_COMPLETION_ENDPOINTS,
+}
 RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
 MAX_RETRY_DELAY = 8.0
@@ -70,12 +82,14 @@ objects의 location은 손 또는 바닥만 사용하세요.
 
 class APIError(Exception):
     def __init__(self, message: str, fatal: bool = False, *, status_code: int | None = None,
-                 model_retired: str = "", retired_models: list[str] | None = None):
+                 model_retired: str = "", retired_models: list[str] | None = None,
+                 transport_kind: str = ""):
         super().__init__(message)
         self.fatal = fatal
         self.status_code = status_code
         self.model_retired = model_retired
         self.retired_models = list(retired_models or [])
+        self.transport_kind = transport_kind
 
 
 @dataclass
@@ -138,6 +152,36 @@ def _http_error(message: str, response: httpx.Response, key: str, *, fatal=False
                     model_retired=model_retired)
 
 
+def _transport_error(error: httpx.TransportError, method: str, url: str,
+                     key: str, timeout_seconds: float) -> APIError:
+    # Exception text may contain credentials, request bodies or proxy URLs.
+    # Report only fixed destinations, a known error category and its class.
+    if isinstance(error, httpx.ReadTimeout):
+        kind = "read_timeout"
+        message = "API 응답 대기 시간이 초과되었습니다."
+        stage = f"응답 대기·요청 전체 {timeout_seconds:g}초 제한"
+    elif isinstance(error, httpx.ConnectTimeout):
+        kind = "connect_timeout"
+        message = "API 서버 연결 시간이 초과되었습니다. 인터넷 연결과 서버 상태를 확인하세요."
+        stage = "서버 연결"
+    elif isinstance(error, httpx.ConnectError):
+        kind = "connect_error"
+        message = "API 연결에 실패했습니다. 인터넷 연결과 서버 상태를 확인하세요."
+        stage = "서버 연결"
+    elif isinstance(error, httpx.WriteTimeout):
+        kind = "write_timeout"
+        message = "API 요청 전송 시간이 초과되었습니다. 인터넷 연결과 서버 상태를 확인하세요."
+        stage = "요청 전송"
+    else:
+        kind = "transport_error"
+        message = "API 연결에 실패했습니다. 인터넷 연결과 서버 상태를 확인하세요."
+        stage = "요청 전송·응답 연결"
+    endpoint = str(httpx.URL(url).copy_with(query=None, fragment=None))
+    description = [message, f"요청: {method} {endpoint}",
+                   f"연결 오류 종류: {type(error).__name__} ({stage})"]
+    return APIError("\n".join(_safe_detail(line, key) for line in description), transport_kind=kind)
+
+
 def _explicit_retirement(response: httpx.Response, key: str, model: str) -> str:
     """A generic 410 is not evidence that a particular model was retired."""
     if response.status_code != 410 or not model:
@@ -163,6 +207,12 @@ def _provider_name(provider: str) -> str:
         if provider.casefold() == name.casefold():
             return name
     raise APIError("지원하지 않는 API 공급자입니다.", fatal=True)
+
+
+def _completion_endpoint(provider: str, model: str) -> str:
+    if provider == "NVIDIA" and model in NVIDIA_COMPLETION_ENDPOINTS:
+        return NVIDIA_COMPLETION_ENDPOINTS[model]
+    return ENDPOINTS[provider] + "/chat/completions"
 
 
 def _image_url(path: Path, cancel: threading.Event) -> str:
@@ -302,9 +352,10 @@ def _request(
         try:
             response = asyncio.run(_async_request(method, url, key, cancel, payload, transport,
                                                  timeout_seconds))
-        except httpx.TransportError:
+        except httpx.TransportError as error:
+            _check_cancel(cancel)
             if attempt == attempts - 1:
-                raise APIError("API 연결에 실패했습니다. 인터넷 연결과 서버 상태를 확인하세요.") from None
+                raise _transport_error(error, method, url, key, timeout_seconds) from None
         else:
             status = response.status_code
             if 200 <= status < 300:
@@ -359,6 +410,9 @@ def _generation_options(provider: str, model: str) -> dict[str, Any]:
         options["reasoning_effort"] = None
     elif model == "moonshotai/kimi-k2.6":
         options["chat_template_kwargs"] = {"thinking": False}
+    elif (model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" or
+          model.startswith("google/gemma-4-")):
+        options["chat_template_kwargs"] = {"enable_thinking": False}
     return options
 
 
@@ -366,6 +420,15 @@ def _vision_prompt(model: str, text: str) -> str:
     if model == "nvidia/nemotron-nano-12b-v2-vl":
         return "/no_think\n" + text
     return text
+
+
+def _vision_content(model: str, text: str, uri: str) -> list[dict[str, Any]]:
+    text_part = {"type": "text", "text": _vision_prompt(model, text)}
+    image_part = {"type": "image_url", "image_url": {"url": uri}}
+    # Gemma 4's official card recommends putting the image before its text.
+    if model.startswith("google/gemma-4-") or model in NVIDIA_COMPLETION_ENDPOINTS:
+        return [image_part, text_part]
+    return [text_part, image_part]
 
 
 class Analyzer:
@@ -386,17 +449,20 @@ class Analyzer:
                            "사진 입력이 검증된 모델을 선택하세요.", fatal=True,
                            model_retired=self.model)
         image_url = _image_url(Path(path), cancel)
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": _vision_prompt(self.model, "이 사진을 규칙에 따라 분석하고 JSON만 반환하세요.")},
-                {"type": "image_url", "image_url": {"url": image_url}},
-            ]},
-        ]
+        text = "이 사진을 규칙에 따라 분석하고 JSON만 반환하세요."
+        messages: list[dict[str, Any]] = []
+        if self.provider == "NVIDIA" and self.model in VISION_USER_INSTRUCTIONS:
+            # Gemma 3 has user/model turns only; Llama 3.2 Vision's official image
+            # prompt puts instructions after the image in a user turn.
+            # Gemma 4's native system-role support remains intact.
+            text = PROMPT + "\n\n" + text
+        else:
+            messages.append({"role": "system", "content": PROMPT})
+        messages.append({"role": "user", "content": _vision_content(self.model, text, image_url)})
         for correction in range(3):
             payload: dict[str, Any] = {"model": self.model, "messages": messages}
             payload.update(_generation_options(self.provider, self.model))
-            response = _request("POST", ENDPOINTS[self.provider] + "/chat/completions",
+            response = _request("POST", _completion_endpoint(self.provider, self.model),
                                 self._key, cancel, payload, self._transport)
             content = _message_text(response)
             _check_cancel(cancel)
@@ -465,12 +531,12 @@ def _vision_challenge(model: str) -> tuple[dict[str, Any], dict[str, str]]:
               "Identify the color on its left and on its right. "
               "Use only red, green, blue or yellow. "
               'Return a JSON object with keys "left" and "right", without explanation.')
-    payload = {"model": model, "messages": [{"role": "user", "content": [
-        {"type": "text", "text": _vision_prompt(model, prompt)},
-        {"type": "image_url", "image_url": {"url": uri}},
-    ]}]}
+    payload = {"model": model, "messages": [
+        {"role": "user", "content": _vision_content(model, prompt, uri)},
+    ]}
     payload.update(_generation_options("NVIDIA", model))
-    payload["max_tokens"] = 128
+    payload["max_tokens"] = (1024 if model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+                             else 128)
     return payload, expected
 
 
@@ -515,9 +581,8 @@ def discover_photo_models(
     skipped = set(excluded) | RETIRED_NVIDIA_MODELS
     candidates = [model for model in photo_models(provider, catalog) if model not in skipped]
     preferred = preferred.strip()
-    if preferred and preferred in catalog and preferred not in skipped:
-        if preferred in candidates:
-            candidates.remove(preferred)
+    if preferred in candidates:
+        candidates.remove(preferred)
         candidates.insert(0, preferred)
     candidates = candidates[:8]
     verified, retired, notes = [], [], []
@@ -527,21 +592,30 @@ def discover_photo_models(
             progress(index, len(candidates), model)
         payload, expected = _vision_challenge(model)
         try:
-            response = _request("POST", ENDPOINTS[provider] + "/chat/completions", key, cancel,
+            response = _request("POST", _completion_endpoint(provider, model), key, cancel,
                                 payload, transport, attempts=1, timeout_seconds=30)
         except APIError as error:
             if error.model_retired:
                 retired.append(error.model_retired)
                 notes.append(f"{model}: 서버가 모델 제공 종료를 확인했습니다.")
                 continue
-            # A missing individual model or a rejected image may be skipped.
-            # Auth, quota, generic 410, or network failure affects the whole check.
-            if error.status_code == 404 or (error.status_code == 400 and
-                    re.search(r"image|vision|multimodal|사진|이미지", str(error), re.IGNORECASE)):
-                notes.append(f"{model}: 사진 입력을 확인하지 못했습니다. {error}")
+            if error.status_code in {401, 402, 403, 429}:
+                error.retired_models = list(retired)
+                raise
+            if error.transport_kind == "read_timeout":
+                notes.append(f"{model}: 응답 대기 시간이 초과되어 다음 후보를 확인합니다. {error}")
                 continue
-            error.retired_models = list(retired)
-            raise
+            if error.status_code is None:
+                if not verified:
+                    error.retired_models = list(retired)
+                    raise
+                notes.append(f"{model}: 연결 문제로 추가 확인을 중단했습니다. "
+                             "앞서 사진 입력을 확인한 모델만 표시합니다. " + str(error))
+                break
+            # Candidate-specific rejection or outage does not discard earlier
+            # successes. Generic 410 never marks the candidate as retired.
+            notes.append(f"{model}: 사진 입력을 확인하지 못했습니다. {error}")
+            continue
         try:
             content = _message_text(response)
         except APIError:
@@ -597,13 +671,14 @@ def diagnose_connection(
         report.append("\n모델이 선택되지 않아 분석 경로 요청을 생략했습니다.")
         _check_cancel(cancel)
         return "\n".join(report)
-    report.extend(["", f"2. 분석 경로: POST {base}/chat/completions",
+    completion_endpoint = _completion_endpoint(provider, model)
+    report.extend(["", f"2. 분석 경로: POST {completion_endpoint}",
                    "사진 없이 짧은 텍스트 요청을 보냅니다. API 사용량이 소량 발생할 수 있습니다."])
     payload = {"model": model, "messages": [{"role": "user", "content": 'Reply with JSON: {"ok":true}'}]}
     payload.update(_generation_options(provider, model))
     payload["max_completion_tokens" if provider == "OpenAI" else "max_tokens"] = 32
     try:
-        response = _request("POST", base + "/chat/completions", key, cancel, payload, transport)
+        response = _request("POST", completion_endpoint, key, cancel, payload, transport)
         report.append(f"HTTP {response.status_code}")
         _message_text(response)
     except APIError as exc:

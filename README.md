@@ -1,4 +1,4 @@
-# FrameTag v2.0.5
+# FrameTag v2.0.6
 
 사진을 NVIDIA 또는 OpenAI의 이미지 분석 API로 분석하고, 성별 표현·의류·정물을 조합한 이름으로 바꾸는 Windows 프로그램입니다.
 
@@ -23,11 +23,15 @@ API 키는 [NVIDIA](https://build.nvidia.com/settings/api-keys) 또는 [OpenAI](
 
 **사용 가능한 모델 확인**은 현재 키로 서버 모델 목록을 조회하고, 목록에 있는 사진 입력 후보에 메모리에서 만든 작은 색상 이미지를 보냅니다. 왼쪽·오른쪽의 실제 색상을 올바르게 답한 모델만 선택 목록에 올립니다. 사용자 사진·폴더는 이 확인에 사용하지 않습니다. 최대 8개 후보를 확인해 최대 3개를 표시하며, 확인 요청에는 소량의 API 사용량이 발생할 수 있습니다. 확인 중에는 진행 표시가 움직이며 같은 버튼으로 중지할 수 있습니다.
 
-후보는 [NVIDIA LangChain 통합의 사진 모델 등록 정보](https://github.com/langchain-ai/langchain-nvidia/blob/main/libs/ai-endpoints/langchain_nvidia_ai_endpoints/_statics.py)를 바탕으로 Nemotron Omni, Step, Ministral, Kimi, Llama, Nemotron VL 등으로 확대했습니다. 서버가 반환한 새로운 VL/vision/omni 모델 ID도 후보에 포함합니다. 이는 등록·이름으로 찾은 후보이며, 실제 이미지 요청 확인 전에는 사용할 수 있는 모델로 표시하지 않습니다. 모델 ID를 직접 입력하면 서버 목록에 있는 해당 모델을 먼저 확인합니다. 이미지 입력 확인은 의류 분류의 정확도·속도·비용을 비교한 결과가 아닙니다.
+사용자가 보내 준 80개 모델의 실제 서버 목록에 맞춰 **Kimi K2.6 → Nemotron 3 Nano Omni 30B → Gemma 4 31B → Gemma 3 12B/4B → Llama 3.2 Vision 11B/90B** 순서로 확인합니다. Nemotron Omni의 정확한 ID는 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`입니다. 사진 태그에 불필요한 추론은 제작사가 안내한 설정으로 끄고, Llama 3.2 Vision은 NVIDIA의 모델별 전용 경로와 이미지가 먼저 오는 사용자 메시지를 사용합니다. Gemma 3도 지시문을 사용자 메시지에 합쳐 모델의 입력 형식에 맞춥니다.
+
+Gemma와 Omni의 이미지 입력은 [Google 모델 카드](https://huggingface.co/google/gemma-4-31B-it)와 [NVIDIA 모델 카드](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16), 전용 API 경로는 [NVIDIA LangChain 통합](https://github.com/langchain-ai/langchain-nvidia/blob/main/libs/ai-endpoints/langchain_nvidia_ai_endpoints/_statics.py)을 참고했습니다. 서버가 반환한 새로운 VL/vision/omni ID도 후보로 확인하지만 임베딩·검색·안전 분류 모델은 제외합니다. 별도 요청 형식이 필요한 Phi-3 Vision도 이 버전의 확인 후보에서 제외합니다. 모델 ID를 직접 입력하면 서버 목록과 지원 후보에 포함된 경우 먼저 확인합니다. 이는 이미지 요청 확인 전의 후보이며, 의류 분류 정확도·속도·비용의 비교 순위가 아닙니다.
 
 키를 바꾸면 해당 키로 모델을 다시 확인해야 합니다. 실행을 다시 시작할 때 저장된 모델 선택은 복원하지만 확인 성공 상태는 복원하지 않습니다. 저장된 자동 감시는 원래 모델의 이미지 확인이 성공한 뒤 켜지며, 다른 모델만 성공한 경우에는 중지 상태를 유지합니다. 확인된 모델을 선택한 뒤 자동 감시를 켜세요.
 
-서버가 특정 모델의 제공 종료를 명시한 경우에는 해당 ID만 저장해 다음 실행에서도 제외합니다. 일반적인 HTTP 410은 모델 종료로 단정하지 않습니다. 인증·권한·한도·네트워크·공통 경로 오류에서는 확인을 멈추고 서버 설명을 표시합니다. 확인을 통과한 후보가 없으면 **API 연결 진단 → 진단 결과 복사**로 서버의 전체 모델 ID 목록을 확인할 수 있습니다. 모델을 선택하지 않은 상태에서도 진단을 실행할 수 있습니다.
+서버가 특정 모델의 제공 종료를 명시한 경우에는 해당 ID만 저장해 다음 실행에서도 제외합니다. 일반적인 HTTP 410은 모델 종료로 단정하지 않습니다. 개별 모델의 요청 오류나 응답 시간 초과는 기록하고 다음 후보를 확인하며, 앞서 통과한 모델은 유지합니다. 인증·권한·결제·호출 한도 오류는 확인을 즉시 중단합니다. 연결 오류는 추가 확인을 중단하지만 앞서 통과한 모델이 있으면 유지합니다. 실패 사유가 있거나 통과한 모델이 없으면 복사 가능한 확인 결과 창을 표시합니다. 연결 오류에는 요청 경로와 실패 종류를 표시해 응답 시간 초과와 서버 연결 실패를 구분합니다.
+
+확인을 통과한 후보가 없으면 **API 연결 진단 → 진단 결과 복사**로 서버의 전체 모델 ID 목록도 확인할 수 있습니다. 모델을 선택하지 않은 상태에서도 진단을 실행할 수 있습니다.
 
 ## 새 키로도 API 오류가 날 때
 

@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from . import __version__
 from .api import (APIError, Cancelled, ModelDiscovery,
-                  diagnose_connection, discover_photo_models, list_models)
+                  _safe_detail, diagnose_connection, discover_photo_models, list_models)
 from .domain import is_gender_prefixed_filename, select_through
 from .model_catalog import DEFAULT_MODELS, RETIRED_NVIDIA_MODELS, model_id, model_label, restore_model
 from .engine import Engine
@@ -534,9 +534,24 @@ class FrameTagApp(tk.Tk):
             self.events.put(("diagnostic", (revision, report)))
         threading.Thread(target=run, daemon=True, name="api-diagnostic").start()
 
-    def _show_diagnostic(self, report):
+    def _show_model_verification(self, provider, models, notes, key):
+        # Discovery sends only a synthetic image, so this report needs no
+        # photograph, local path, credentials, or further API requests.
+        lines = [f"공급자: {_safe_detail(provider, key, 100)}", "",
+                 f"사진 입력 확인을 통과한 모델: {len(models)}개"]
+        lines.extend(f"- {_safe_detail(identifier, key, 240)}" for identifier in models)
+        if not models:
+            lines.append("통과한 모델이 없습니다.")
+        lines.extend(["", "모델별 확인 내용:"])
+        lines.extend(f"- {_safe_detail(note, key, 1600)}" for note in notes)
+        if not notes:
+            lines.append("계정 목록에서 사진 입력 확인을 통과한 후보를 찾지 못했습니다.")
+        self._show_diagnostic("\n".join(lines), title="FrameTag 사진 모델 확인 결과",
+                              copy_label="모델 확인 결과 복사")
+
+    def _show_diagnostic(self, report, *, title="FrameTag API 연결 진단", copy_label="진단 결과 복사"):
         dialog = tk.Toplevel(self)
-        dialog.title("FrameTag API 연결 진단")
+        dialog.title(title)
         dialog.geometry("850x540")
         frame = ttk.Frame(dialog, padding=10)
         frame.pack(fill="both", expand=True)
@@ -550,10 +565,11 @@ class FrameTagApp(tk.Tk):
         def copy():
             self.clipboard_clear()
             self.clipboard_append(report)
-            self.status.set("키를 숨긴 API 진단 결과를 복사했습니다.")
+            self.status.set("키를 숨긴 API 진단 결과를 복사했습니다." if copy_label == "진단 결과 복사" else
+                            "키를 숨긴 모델 확인 결과를 복사했습니다.")
         buttons = ttk.Frame(dialog, padding=(10, 0, 10, 10))
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="진단 결과 복사", command=copy).pack(side="left")
+        ttk.Button(buttons, text=copy_label, command=copy).pack(side="left")
         ttk.Button(buttons, text="닫기", command=dialog.destroy).pack(side="right")
 
     def _browse(self):
@@ -1044,6 +1060,8 @@ class FrameTagApp(tk.Tk):
                     elif resume_auto:
                         self.status.set(self.status.get() + " 기존 모델을 확인하지 못해 자동 감시는 중지 상태입니다.")
                     self._save_settings()
+                    if provider == "NVIDIA" and (result.notes or not models):
+                        self._show_model_verification(provider, models, result.notes, key)
                 else:
                     self.status.set("설정이 바뀌어 이전 모델 조회 결과를 적용하지 않았습니다. 다시 확인하세요.")
             elif name == "model_progress":
@@ -1060,9 +1078,11 @@ class FrameTagApp(tk.Tk):
                 self._resume_auto_after_models = False
                 self._finish_model_lookup()
                 if revision == self._api_revision and not self._model_cancel.is_set():
+                    provider, key = self.provider.get(), self.api_key.get().strip()
+                    selected = self.model.get().strip() or "(선택하지 않음)"
                     self._record_retired_models(retired)
-                    self.status.set(message)
-                    messagebox.showerror("모델 목록", message, parent=self)
+                    self.status.set(_safe_detail(message, key, 1600))
+                    self._show_model_verification(provider, [], [f"선택 모델: {selected}", message], key)
             elif name == "diagnostic":
                 revision, report = data
                 self._diagnosing = False
