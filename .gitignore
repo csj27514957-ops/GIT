@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.spec
+FrameTag-distribution.zip
+FrameTag-source.zip
+.env
+.env.*
+settings.json
+.frametag_v2.sqlite3*
+.frametag_watch_v2.json
+frametag_history_v2.json
