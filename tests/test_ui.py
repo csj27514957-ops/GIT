@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -166,6 +167,93 @@ class UITests(unittest.TestCase):
         self.assertEqual(self.app.engine.get_root(), self.folder.resolve())
         self.assertEqual(FakeAnalyzer.calls, [])
         self.assertFalse(self.errors)
+
+    def test_completed_photos_default_hidden_can_show_and_edit_without_losing_undo(self):
+        first = str(self.app.photos[0].path)
+        self.app.engine.update_photo(first, "proposed_name", "남성_검정반팔_파랑청바지.jpg")
+        self.wait(lambda: bool(self.app.by_id[first].proposed_name))
+        self.app.tree.selection_set(first)
+        self.app._apply()
+        self.wait(lambda: len(self.app.tree.get_children()) == 2 and not self.app._busy)
+        renamed = str(self.folder / "남성_검정반팔_파랑청바지.jpg")
+        self.assertTrue(self.app.by_id[renamed].confirmed)
+        self.assertFalse(self.app.show_completed.get())
+        self.assertNotIn(renamed, self.app.tree.get_children())
+        self.assertIn("완료 1장 숨김", self.app.count.get())
+        self.app.show_completed.set(True)
+        self.app._completed_filter_changed()
+        self.assertIn(renamed, self.app.tree.get_children())
+        self.app._save_settings()
+        self.assertTrue(self.settings.load()["show_completed"])
+        self.app.show_completed.set(False)
+        self.app._completed_filter_changed()
+        self.app.engine.update_photo(renamed, "objects", "우산")
+        self.wait(lambda: renamed in self.app.tree.get_children())
+        self.assertFalse(self.app.by_id[renamed].confirmed)
+        self.app._undo()
+        self.wait(lambda: first in self.app.tree.get_children() and not self.app._busy)
+        self.assertTrue(Path(first).exists())
+        self.assertFalse(Path(renamed).exists())
+        self.assertFalse(self.errors)
+
+    def test_arrival_during_slow_manual_analysis_is_visible_then_renamed_once(self):
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original_analyze = FakeAnalyzer.analyze
+        first = str(self.folder / "photo1.jpg")
+        incoming = self.folder / "incoming.jpg"
+
+        def slow_analyze(analyzer, path, cancel):
+            if path.name == "photo1.jpg":
+                entered.set()
+                while not release.wait(.01) and not cancel.is_set():
+                    pass
+            return original_analyze(analyzer, path, cancel)
+
+        with patch.object(FakeAnalyzer, "analyze", slow_analyze):
+            try:
+                self.app.auto_watch.set(True)
+                self.app._toggle_auto()
+                self.app._analyze()
+                self.wait(entered.is_set)
+                Image.new("RGB", (45, 65), "white").save(incoming)
+                self.wait(lambda: len(self.app.photos) == 4 and str(incoming) in self.app.by_id)
+                self.assertFalse(release.is_set())
+                self.assertTrue(self.app._busy)
+                self.assertIsNone(self.app.by_id[str(incoming)].analysis)
+                self.assertEqual(self.app.by_id[str(incoming)].status, "대기")
+                revision = self.app.by_id[first].revision
+                self.app.engine.update_photo(first, "objects", "직접수정우산")
+                self.wait(lambda: self.app.by_id[first].revision > revision)
+                release.set()
+                self.wait(lambda: not self.app._busy and len(self.app.photos) == 4
+                          and all(photo.analysis for photo in self.app.photos)
+                          and sum(photo.confirmed for photo in self.app.photos) == 1)
+                self.assertFalse(incoming.exists())
+                self.assertTrue(all((self.folder / f"photo{number}.jpg").exists()
+                                    for number in range(1, 4)))
+                self.assertTrue(self.app.by_id[first].manual)
+                self.assertEqual(self.app.by_id[first].analysis["objects"], ["직접수정우산"])
+                self.assertEqual(self.app.by_id[first].analysis["clothing"], [])
+                self.assertEqual(sorted(FakeAnalyzer.calls),
+                                 ["incoming.jpg", "photo1.jpg", "photo2.jpg", "photo3.jpg"])
+                self.assertEqual(str(self.app.apply_button["state"]), "normal")
+                self.assertEqual(str(self.app.undo_button["state"]), "normal")
+                self.app.tree.selection_set(first)
+                self.app._apply()
+                self.wait(lambda: not self.app._busy
+                          and sum(photo.confirmed for photo in self.app.photos) == 2)
+                self.app._undo()
+                self.wait(lambda: not self.app._busy and first in self.app.by_id
+                          and sum(photo.confirmed for photo in self.app.photos) == 1)
+                self.assertEqual(self.app.by_id[first].analysis["objects"], ["직접수정우산"])
+                deadline = time.monotonic() + .15
+                self.wait(lambda: time.monotonic() >= deadline)
+                self.assertEqual(FakeAnalyzer.calls.count("incoming.jpg"), 1)
+                self.assertFalse(self.errors)
+            finally:
+                release.set()
 
     def test_mock_tray_hide_show_and_complete_exit_keep_worker_alive_until_exit(self):
         class FakeTray:

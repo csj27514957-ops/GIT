@@ -1,7 +1,8 @@
 """Sequential analysis and persistent, copy-safe folder watching.
 
 The callback receives immutable-by-convention snapshots and never touches a GUI.
-All API calls run on one cancellable worker; rename operations share its lock.
+A scanner discovers arrivals during API waits. All API calls run on one
+cancellable worker; scans and rename operations share its lock.
 """
 from __future__ import annotations
 
@@ -17,8 +18,8 @@ from PIL import Image
 
 from .api import APIError, Analyzer, Cancelled
 from .domain import (filename_from_analysis, list_images, natural_key,
-                     normalize_analysis, sanitize_filename, select_through,
-                     unify_runs)
+                     normalize_analysis, parse_frametag_filename,
+                     sanitize_filename, select_through, unify_runs)
 from .models import Photo
 from .rename import apply_names, recover_pending, undo_last
 from .storage import Cache, atomic_json
@@ -33,6 +34,7 @@ class Engine:
         self._factory = analyzer_factory
         self._lock = threading.RLock()
         self._wake = threading.Event()
+        self._watch_stop = threading.Event()
         self._cancel = threading.Event()
         self._closed = False
         self._busy = False
@@ -50,7 +52,9 @@ class Engine:
         self._consecutive_failures = 0
         self._manifest_error = ""
         self._worker = threading.Thread(target=self._run, name="FrameTag-worker", daemon=True)
+        self._watcher = threading.Thread(target=self._run_watch, name="FrameTag-watch", daemon=True)
         self._worker.start()
+        self._watcher.start()
 
     def _emit(self, event: str, value: Any) -> None:
         self._callback(event, value)
@@ -237,6 +241,7 @@ class Engine:
         paths = list_images(self._root, self._recursive)
         present: set[str] = set()
         changed, manifest_changed = False, False
+        recognized: list[Photo] = []
         for path in paths:
             path = path.resolve()
             try:
@@ -249,12 +254,25 @@ class Engine:
             self._stable[name] = (fingerprint, count + 1 if previous_fingerprint == fingerprint else 1)
             photo = self._photos.get(identifier)
             if photo is None or (photo.size, photo.mtime_ns) != fingerprint:
-                photo = self._cache.get(path) or Photo(path, *fingerprint)
+                # A matching cache owns the user's edits and undo state. Only
+                # infer completion from a filename when no valid record exists.
+                photo = self._cache.get(path)
+                if photo is None:
+                    analysis = parse_frametag_filename(path.name)
+                    photo = Photo(path, *fingerprint)
+                    if analysis is not None:
+                        photo.analysis = analysis
+                        photo.proposed_name = path.name
+                        photo.confirmed = True
+                        photo.status = "기존 이름 변경 완료"
+                        recognized.append(photo)
                 self._photos[identifier] = photo
                 changed = True
             previous = self._known.get(name)
             if (previous is None or self._record_fingerprint(previous) != fingerprint
-                    or not previous.get("present", True)):
+                    or not previous.get("present", True)
+                    or ((photo.confirmed or photo.manual)
+                        and previous.get("state") != "processed")):
                 added_scope_baseline = baseline_subfolders and previous is None and "/" in name
                 state = "baseline" if first_baseline or added_scope_baseline else "pending"
                 if photo.confirmed or photo.manual:
@@ -273,6 +291,10 @@ class Engine:
                 record["present"] = False
                 self._stable.pop(name, None)
                 manifest_changed = True
+        if recognized:
+            # Recognition stores existing metadata without creating a rename
+            # transaction or charging an analysis request, including on restart.
+            self._cache.put_many(recognized)
         if manifest_changed:
             self._save_manifest()
         if changed:
@@ -340,6 +362,10 @@ class Engine:
                 photo = self._photos.get(identifier)
                 if photo is None:
                     return "stale"
+                if (photo.size, photo.mtime_ns) != (snapshot.size, snapshot.mtime_ns):
+                    # The watcher already replaced this row with a new file's
+                    # pending state; the response still belongs to the old file.
+                    return "stale"
                 if photo.revision != snapshot.revision:
                     # A user edit made during the request owns both the result and filename.
                     self._mark(photo, "processed")
@@ -381,7 +407,8 @@ class Engine:
         except Cancelled:
             with self._lock:
                 photo = self._photos.get(identifier)
-                if photo is not None and photo.revision == snapshot.revision:
+                if (photo is not None and photo.revision == snapshot.revision
+                        and (photo.size, photo.mtime_ns) == (snapshot.size, snapshot.mtime_ns)):
                     photo.status = snapshot.status if snapshot.status != "분석 중" else "대기"
                     photo.error = snapshot.error
                     cache.put(photo)
@@ -390,7 +417,9 @@ class Engine:
         except Exception as exc:
             with self._lock:
                 photo = self._photos.get(identifier)
-                if photo is not None and photo.revision == snapshot.revision:
+                if photo is None or (photo.size, photo.mtime_ns) != (snapshot.size, snapshot.mtime_ns):
+                    return "stale"
+                if photo.revision == snapshot.revision:
                     photo.status, photo.error = "오류", str(exc)
                     cache.put(photo)
                     self._mark(photo, "error")
@@ -414,9 +443,6 @@ class Engine:
             if result in {"halt", "cancelled"}:
                 halted = result == "halt"
                 break
-            with self._lock:
-                if time.monotonic() - self._last_poll >= self._interval:
-                    self._poll()
         with self._lock:
             if self._cache is not None:
                 changed = unify_runs(sorted(self._photos.values(), key=lambda p: (
@@ -432,6 +458,25 @@ class Engine:
                 message = "남은 사진 분석을 마쳤습니다."
             self._emit("status", message)
 
+    def _run_watch(self) -> None:
+        """Keep arrivals visible while the worker waits for an API response.
+
+        Rename transactions keep the same lock through staging and commit, so
+        the scanner never observes their temporary missing or partial state.
+        """
+        while not self._watch_stop.wait(self._interval):
+            with self._lock:
+                if self._closed:
+                    return
+                if self._root is None or time.monotonic() - self._last_poll < self._interval:
+                    continue
+                try:
+                    self._poll()
+                except Exception as exc:
+                    self._pause_for_failure(f"폴더 감시 오류: {exc}")
+            # The worker remains the only consumer of queued analysis tasks.
+            self._wake.set()
+
     def _run(self) -> None:
         while True:
             self._wake.wait(self._interval)
@@ -446,8 +491,6 @@ class Engine:
                     continue
                 else:
                     try:
-                        if time.monotonic() - self._last_poll >= self._interval:
-                            self._poll()
                         identifier = self._ready_auto_photo() if self._auto else None
                     except Exception as exc:
                         self._pause_for_failure(f"폴더 감시 오류: {exc}")
@@ -609,7 +652,12 @@ class Engine:
             self._cancel.set()
             self._save_manifest()
         self._wake.set()
-        if threading.current_thread() is not self._worker:
-            self._worker.join(timeout=5.0)
-            if self._worker.is_alive():
-                self._emit("error", "분석 작업의 종료를 기다리고 있습니다. 네트워크 요청은 취소되었습니다.")
+        self._watch_stop.set()
+        for thread in (self._watcher, self._worker):
+            if threading.current_thread() is thread:
+                continue
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                message = ("폴더 감시 작업의 종료를 기다리고 있습니다." if thread is self._watcher
+                           else "분석 작업의 종료를 기다리고 있습니다. 네트워크 요청은 취소되었습니다.")
+                self._emit("error", message)

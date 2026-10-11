@@ -4,7 +4,7 @@ from pathlib import Path
 
 from frametag.domain import (
     filename_from_analysis, list_images, natural_key, normalize_analysis,
-    sanitize_filename, select_through, unify_runs,
+    parse_frametag_filename, sanitize_filename, select_through, unify_runs,
 )
 from frametag.models import Photo
 
@@ -72,6 +72,78 @@ class FilenameTests(unittest.TestCase):
         self.assertEqual(Path(result).suffix, ".png")
         self.assertNotIn("/", result)
         self.assertEqual(sanitize_filename(result, ".png"), result)
+
+
+class ExistingFrameTagNameTests(unittest.TestCase):
+    def test_actual_existing_photo_names_keep_clothes_without_collision_number(self):
+        cases = {
+            "여성_흰색반팔_검정긴바지_3.jpg": {
+                "gender": "여성", "clothing": ["흰색반팔", "검정긴바지"], "objects": []},
+            "남성_흰색반팔_검정반바지_16.JPG": {
+                "gender": "남성", "clothing": ["흰색반팔", "검정반바지"], "objects": []},
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(parse_frametag_filename(name), expected)
+
+    def test_documented_filename_and_legacy_collision_styles(self):
+        expected = {"gender": "남성", "clothing": ["검정반팔", "파랑청바지"],
+                    "objects": ["가방(손)", "캐리어(바닥)"]}
+        for ending in (".jpg", "_2.JPG", "_16.jpeg", "_(2).png", " (2).webp"):
+            name = "남성_검정반팔_파랑청바지_손-가방_바닥-캐리어" + ending
+            with self.subTest(name=name):
+                self.assertEqual(parse_frametag_filename(name), expected)
+
+    def test_dress_bottom_only_and_known_colors(self):
+        cases = {
+            "여성_빨강원피스.jpg": ["빨강원피스"],
+            "불명_베이지멜빵바지.png": ["베이지멜빵바지"],
+            "남성_카키조끼_회색레깅스.gif": ["카키조끼", "회색레깅스"],
+            "여성_다색체크셔츠_분홍치마.jpeg": ["다색체크셔츠", "분홍치마"],
+            "남성_주황우비_갈색긴바지.webp": ["주황우비", "갈색긴바지"],
+            "불명_보라후드_초록반바지.JPG": ["보라후드", "초록반바지"],
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(parse_frametag_filename(name)["clothing"], expected)
+
+    def test_manual_objects_and_location_are_preserved_without_ai_exclusions(self):
+        name = "여성_노랑긴팔_파랑청바지_우산_상자_바닥-의자_바닥-종이.jpg"
+        self.assertEqual(parse_frametag_filename(name), {
+            "gender": "여성", "clothing": ["노랑긴팔", "파랑청바지"],
+            "objects": ["우산", "상자", "의자(바닥)", "종이(바닥)"],
+        })
+
+    def test_explicit_objects_are_recognized_when_clothes_are_unavailable(self):
+        self.assertEqual(parse_frametag_filename("남성_손-휴대폰_바닥-가방.jpg"), {
+            "gender": "남성", "clothing": [], "objects": ["휴대폰(손)", "가방(바닥)"],
+        })
+
+    def test_exact_uncertain_and_no_person_output_without_clothes(self):
+        for name in ("불명.jpg", "인물없음.JPG", "불명_2.png", "인물없음 (3).gif"):
+            with self.subTest(name=name):
+                self.assertEqual(parse_frametag_filename(name), {
+                    "gender": name.split(".")[0].split("_")[0].split(" ")[0],
+                    "clothing": [], "objects": [],
+                })
+
+    def test_original_and_arbitrary_manual_names_are_not_guessed(self):
+        for name in ("IMG_20261011_123456.jpg", "1 (2).jpg", "사진.jpg",
+                     "여성.jpg", "남성.jpg", "여성_참고.jpg", "남성_검정옷.jpg",
+                     "여성_원피스.jpg", "불명_참고.jpg", "여성_우산_상자.jpg",
+                     "여성_흰색반팔_검정긴바지.txt"):
+            with self.subTest(name=name):
+                self.assertIsNone(parse_frametag_filename(name))
+
+    def test_malformed_structured_names_are_not_guessed(self):
+        for name in ("남성_검정반팔__파랑청바지.jpg", "남성_없는색반팔.jpg",
+                     "여성_파랑청바지_검정반팔.jpg", "여성_빨강원피스_검정치마.jpg",
+                     "남성_검정반팔_흰색셔츠.jpg", "남성_검정반팔_파랑청바지_검정조끼.jpg",
+                     "남성_손-.jpg", "남성_검정반팔_손-가방_.jpg",
+                     "../남성_검정반팔.jpg", r"folder\남성_검정반팔.jpg",
+                     "남성_검정반팔_손:가방.jpg"):
+            with self.subTest(name=name):
+                self.assertIsNone(parse_frametag_filename(name))
 
 
 class SequenceTests(unittest.TestCase):

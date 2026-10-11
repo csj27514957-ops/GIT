@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
+from . import __version__
 from .api import DEFAULT_MODELS, list_models
 from .engine import Engine
 from .models import Photo
@@ -22,7 +23,7 @@ class FrameTagApp(tk.Tk):
     def __init__(self, background=False, settings_store=None, key_store=None,
                  engine_factory=Engine):
         super().__init__()
-        self.title("FrameTag")
+        self.title(f"FrameTag {__version__}")
         self.minsize(1050, 680)
         self.configure(background="#edf5ef")
         self.settings_store = settings_store or SettingsStore()
@@ -69,6 +70,7 @@ class FrameTagApp(tk.Tk):
         self.recursive = tk.BooleanVar(value=bool(saved.get("recursive", False)))
         self.auto_watch = tk.BooleanVar(value=False)
         self.close_to_tray = tk.BooleanVar(value=bool(saved.get("close_to_tray", True)))
+        self.show_completed = tk.BooleanVar(value=bool(saved.get("show_completed", False)))
         self.search = tk.StringVar()
         self.status = tk.StringVar(value="폴더와 API 키를 선택하세요. 설정은 다음 실행에도 유지됩니다.")
         self.count = tk.StringVar(value="0 / 0")
@@ -170,6 +172,8 @@ class FrameTagApp(tk.Tk):
         self.auto_check.pack(side="left", padx=(0, 15))
         ttk.Checkbutton(monitor, text="창 닫을 때 트레이로 숨기기", variable=self.close_to_tray,
                         command=self._schedule_save).pack(side="left")
+        ttk.Checkbutton(monitor, text="이름 변경 완료 사진도 표시", variable=self.show_completed,
+                        command=self._completed_filter_changed).pack(side="left", padx=(15, 0))
         ttk.Button(monitor, text="백그라운드로 숨기기", command=self._hide).pack(side="right", padx=(5, 0))
         ttk.Button(monitor, text="완전히 종료", command=self._exit).pack(side="right")
 
@@ -280,7 +284,8 @@ class FrameTagApp(tk.Tk):
         self._models[self.provider.get()] = self.model.get().strip()
         data = dict(folder=self.folder.get().strip(), recursive=self.recursive.get(),
                     provider=self.provider.get(), models=self._models, auto_watch=self.auto_watch.get(),
-                    close_to_tray=self.close_to_tray.get(), geometry=self.geometry(), sash=self.pane.sashpos(0))
+                    close_to_tray=self.close_to_tray.get(), show_completed=self.show_completed.get(),
+                    geometry=self.geometry(), sash=self.pane.sashpos(0))
         try:
             self.settings_store.save(data)
         except Exception:
@@ -459,6 +464,10 @@ class FrameTagApp(tk.Tk):
             self.after_cancel(self._search_id)
         self._search_id = self.after(180, self._render_rows)
 
+    def _completed_filter_changed(self):
+        self._render_rows()
+        self._schedule_save()
+
     @staticmethod
     def _row_values(photo):
         analysis = photo.analysis or {}
@@ -476,8 +485,12 @@ class FrameTagApp(tk.Tk):
         old_y = self.tree.yview()
         words = self.search.get().casefold().split()
         visible = []
+        hidden_completed = 0
         self.by_id = {str(p.path): p for p in self.photos}
         for photo in self.photos:
+            if photo.confirmed and not self.show_completed.get():
+                hidden_completed += 1
+                continue
             values = self._row_values(photo)
             if all(word in " ".join(map(str, values)).casefold() for word in words):
                 visible.append((photo, values))
@@ -510,9 +523,20 @@ class FrameTagApp(tk.Tk):
         self.tree.selection_set([iid for iid in selected if iid in wanted])
         if focus in wanted:
             self.tree.focus(focus)
+        else:
+            self.tree.focus("")
+            if focus:
+                self._preview_token += 1
+                self._preview_fingerprint = None
+                self._preview_image = None
+                self.canvas.delete("all")
+                self.preview_label.set("사진을 선택하면 미리보기가 표시됩니다.")
         if old_y:
             self.tree.yview_moveto(old_y[0])
-        self.count.set(f"{len(visible):,} / {len(self.photos):,}")
+        count = f"{len(visible):,} / {len(self.photos) - hidden_completed:,}"
+        if hidden_completed:
+            count += f" · 완료 {hidden_completed:,}장 숨김"
+        self.count.set(count)
         completed = sum(bool(p.analysis) for p in self.photos)
         self.progress["value"] = 100 * completed / len(self.photos) if self.photos else 0
 

@@ -11,11 +11,16 @@ from PIL import Image
 
 from frametag.api import APIError, Cancelled
 from frametag.engine import Engine
+from frametag.models import Photo
+from frametag.rename import _move_no_clobber
 from frametag.storage import Cache
 
 
 RESULT = {"gender": "남성", "clothing": ["검정반팔", "파랑청바지"],
           "objects": [{"name": "가방", "location": "손"}]}
+TAGGED_NAME = "여성_흰색반팔_검정반바지_손-종이 (2).png"
+TAGGED_ANALYSIS = {"gender": "여성", "clothing": ["흰색반팔", "검정반바지"],
+                   "objects": ["종이(손)"]}
 
 
 def wait_until(predicate, timeout=3.0):
@@ -69,9 +74,10 @@ class EngineTests(unittest.TestCase):
         for engine in self.engines:
             engine.shutdown()
 
-    def engine(self, interval=0.03):
+    def engine(self, interval=0.03, analyzer_factory=None):
         engine = Engine(lambda kind, value: self.events.append((kind, value)),
-                        interval=interval, stable_scans=3, analyzer_factory=self.api.factory)
+                        interval=interval, stable_scans=3,
+                        analyzer_factory=analyzer_factory or self.api.factory)
         self.engines.append(engine)
         engine.configure("OpenAI", "fake-model", "test-placeholder")
         engine.load_folder(self.root)
@@ -84,6 +90,325 @@ class EngineTests(unittest.TestCase):
 
     def idle(self, engine):
         wait_until(lambda: not engine._busy)
+
+    def test_existing_tagged_filename_is_cached_confirmed_without_rename_history(self):
+        path = self.photo(TAGGED_NAME)
+        before = path.read_bytes()
+        engine = self.engine()
+        photo = engine.get_photos()[0]
+        self.assertEqual(photo.analysis, TAGGED_ANALYSIS)
+        self.assertEqual(photo.proposed_name, TAGGED_NAME)
+        self.assertTrue(photo.confirmed)
+        self.assertFalse(photo.manual)
+        self.assertEqual(photo.status, "기존 이름 변경 완료")
+        self.assertEqual(photo.model, "")
+        self.assertEqual(path.read_bytes(), before)
+        cached = Cache(self.root).get(path)
+        self.assertTrue(cached.confirmed)
+        self.assertEqual(cached.analysis, TAGGED_ANALYSIS)
+        record = json.loads((self.root / ".frametag_watch_v2.json").read_text())
+        self.assertEqual(record["entries"][TAGGED_NAME]["state"], "processed")
+        self.assertFalse((self.root / "frametag_history_v2.json").exists())
+        engine.start_analysis()
+        self.idle(engine)
+        engine.set_auto(True)
+        time.sleep(0.15)
+        self.assertEqual(self.api.calls, [])
+
+    def test_manual_analysis_processes_original_only_in_mixed_folder(self):
+        tagged = self.photo(TAGGED_NAME)
+        original = self.photo("original.png")
+        arbitrary = self.photo("여성_휴가사진.png")
+        engine = self.engine()
+        engine.start_analysis()
+        self.idle(engine)
+        self.assertEqual({call[0] for call in self.api.calls},
+                         {original.name, arbitrary.name})
+        photos = {photo.path.name: photo for photo in engine.get_photos()}
+        self.assertTrue(photos[tagged.name].confirmed)
+        self.assertFalse(photos[original.name].confirmed)
+        self.assertFalse(photos[arbitrary.name].confirmed)
+        self.assertTrue(tagged.exists())
+
+    def test_user_numbered_tagged_names_skip_analysis_and_keep_existing_baseline(self):
+        names = ["여성_흰색반팔_검정긴바지_3.jpg",
+                 "남성_흰색반팔_검정반바지_16.jpg"]
+        paths = [self.photo(name) for name in names]
+        (self.root / ".frametag_watch_v2.json").write_text(json.dumps({
+            "version": 2, "recursive": False, "entries": {
+                path.name: {"state": "baseline", "size": path.stat().st_size,
+                            "mtime_ns": path.stat().st_mtime_ns, "present": True}
+                for path in paths}}), encoding="utf-8")
+        engine = self.engine()
+        self.assertTrue(all(photo.confirmed for photo in engine.get_photos()))
+        self.assertTrue(all(engine._known[name]["state"] == "processed" for name in names))
+        engine.start_analysis()
+        self.idle(engine)
+        engine.set_auto(True)
+        time.sleep(0.15)
+        self.assertEqual(self.api.calls, [])
+        self.assertTrue(all(path.exists() for path in paths))
+        for path in paths:
+            self.assertTrue(Cache(self.root).get(path).confirmed)
+
+    def test_arrival_is_visible_during_slow_auto_analysis_and_waits_for_complete_copy(self):
+        engine = self.engine()
+        engine.set_auto(True)
+        self.api.release.clear()
+        first = self.photo("first.png")
+        self.assertTrue(self.api.entered.wait(2))
+        buffer = io.BytesIO()
+        Image.new("RGB", (48, 32), "blue").save(buffer, format="PNG")
+        contents = buffer.getvalue()
+        incoming = self.root / "incoming.png"
+        incoming.write_bytes(contents[:20])
+        wait_until(lambda: len(engine.get_photos()) == 2)
+        photos = {photo.path.name: photo for photo in engine.get_photos()}
+        self.assertTrue(engine.is_busy())
+        self.assertEqual(photos[incoming.name].status, "대기")
+        self.assertEqual(engine._known[incoming.name]["state"], "pending")
+        self.assertEqual([call[0] for call in self.api.calls], [first.name])
+        self.api.release.set()
+        wait_until(lambda: any(photo.confirmed for photo in engine.get_photos()))
+        self.idle(engine)
+        time.sleep(0.12)
+        self.assertEqual([call[0] for call in self.api.calls], [first.name])
+        incoming.write_bytes(contents)
+        wait_until(lambda: len(engine.get_photos()) == 2
+                   and all(photo.confirmed for photo in engine.get_photos()))
+        self.assertEqual([call[0] for call in self.api.calls], [first.name, incoming.name])
+        self.assertFalse(incoming.exists())
+        self.assertIn(contents, [photo.path.read_bytes() for photo in engine.get_photos()])
+
+    def test_arrival_during_manual_batch_is_visible_and_processed_after_batch(self):
+        originals = [self.photo("first.png"), self.photo("second.png")]
+        engine = self.engine()
+        engine.set_auto(True)
+        self.api.release.clear()
+        engine.start_analysis()
+        self.assertTrue(self.api.entered.wait(2))
+        incoming = self.photo("incoming.png", color="blue")
+        wait_until(lambda: len(engine.get_photos()) == 3)
+        self.assertTrue(engine.is_busy())
+        self.assertEqual([call[0] for call in self.api.calls], [originals[0].name])
+        self.api.release.set()
+        wait_until(lambda: len(self.api.calls) == 3 and not engine.is_busy())
+        self.assertEqual([call[0] for call in self.api.calls],
+                         [originals[0].name, originals[1].name, incoming.name])
+        self.assertTrue(all(path.exists() for path in originals))
+        self.assertFalse(incoming.exists())
+        self.assertEqual(sum(photo.confirmed for photo in engine.get_photos()), 1)
+
+    def test_arrival_during_rename_transaction_is_scanned_after_commit_once(self):
+        original = self.photo()
+        original_contents = original.read_bytes()
+        engine = self.engine()
+        engine.set_auto(True)
+        engine.update_photo(str(original), "proposed_name", "reviewed.png")
+        staged, release = threading.Event(), threading.Event()
+        blocked = False
+
+        def pause_after_first_move(source, target, entry):
+            nonlocal blocked
+            _move_no_clobber(source, target, entry)
+            if not blocked:
+                blocked = True
+                staged.set()
+                if not release.wait(3):
+                    raise AssertionError("rename was not released")
+
+        operation = threading.Thread(target=engine.apply_selected,
+                                     args=([str(original)],), daemon=True)
+        with patch("frametag.rename._move_no_clobber", side_effect=pause_after_first_move):
+            operation.start()
+            try:
+                self.assertTrue(staged.wait(2))
+                incoming = self.photo("incoming.png", color="blue")
+                incoming_contents = incoming.read_bytes()
+                time.sleep(0.12)
+                self.assertFalse(original.exists())  # Already staged to the temporary name.
+                self.assertEqual(self.api.calls, [])
+                # Scanning waits for the transaction lock; transient staging
+                # state must never publish a disappearing original or temp row.
+                snapshots = [value for kind, value in self.events if kind == "photos"]
+                self.assertEqual([photo.path.name for photo in snapshots[-1]], [original.name])
+            finally:
+                release.set()
+                operation.join(3)
+            self.assertFalse(operation.is_alive())
+            wait_until(lambda: len(engine.get_photos()) == 2
+                       and all(photo.confirmed for photo in engine.get_photos()))
+        self.assertEqual([call[0] for call in self.api.calls], [incoming.name])
+        self.assertEqual((self.root / "reviewed.png").read_bytes(), original_contents)
+        self.assertIn(incoming_contents, [photo.path.read_bytes() for photo in engine.get_photos()])
+        history = json.loads((self.root / "frametag_history_v2.json").read_text())
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["entries"][0]["source"], original.name)
+        self.assertEqual(history[0]["entries"][0]["target"], "reviewed.png")
+        self.assertEqual(history[1]["entries"][0]["source"], incoming.name)
+        self.assertFalse((self.root / ".frametag_pending_v2.json").exists())
+        self.assertEqual(list(self.root.glob(".frametag-*.tmp")), [])
+
+    def test_auto_disabled_still_queues_arrival_during_manual_analysis(self):
+        original = self.photo()
+        engine = self.engine()
+        self.api.release.clear()
+        engine.start_analysis()
+        self.assertTrue(self.api.entered.wait(2))
+        incoming = self.photo("incoming.png")
+        wait_until(lambda: len(engine.get_photos()) == 2)
+        self.assertEqual(engine._known[incoming.name]["state"], "pending")
+        self.assertTrue(engine.is_busy())
+        self.api.release.set()
+        self.idle(engine)
+        time.sleep(0.12)
+        self.assertEqual([call[0] for call in self.api.calls], [original.name])
+        self.assertTrue(incoming.exists())
+        photos = {photo.path.name: photo for photo in engine.get_photos()}
+        self.assertEqual(photos[incoming.name].status, "대기")
+        self.assertIsNone(photos[incoming.name].analysis)
+        engine.set_auto(True)
+        wait_until(lambda: any(photo.confirmed for photo in engine.get_photos()))
+        self.assertEqual([call[0] for call in self.api.calls], [original.name, incoming.name])
+
+    def test_shutdown_cancels_request_and_stops_worker_and_watcher(self):
+        engine = self.engine()
+        engine.set_auto(True)
+        self.api.release.clear()
+        self.photo("first.png")
+        self.assertTrue(self.api.entered.wait(2))
+        self.photo("incoming.png")
+        wait_until(lambda: len(engine.get_photos()) == 2)
+        engine.shutdown()
+        self.assertFalse(engine._worker.is_alive())
+        self.assertFalse(engine._watcher.is_alive())
+        self.assertEqual([call[0] for call in self.api.calls], ["first.png"])
+        record = json.loads((self.root / ".frametag_watch_v2.json").read_text())
+        self.assertEqual(record["entries"]["incoming.png"]["state"], "pending")
+
+    def test_stale_request_error_does_not_poison_watcher_replaced_file(self):
+        api = self.api
+
+        def factory(provider, model, key):
+            delegate = api.factory(provider, model, key)
+
+            class Analyzer:
+                def analyze(self, path, cancel):
+                    first_call = not api.calls
+                    result = delegate.analyze(path, cancel)
+                    if first_call:
+                        raise APIError("이전 파일 요청 오류", fatal=True)
+                    return result
+
+            return Analyzer()
+
+        engine = self.engine(analyzer_factory=factory)
+        engine.set_auto(True)
+        api.release.clear()
+        self.photo("first.png")
+        self.assertTrue(api.entered.wait(2))
+        previous = engine.get_photos()[0]
+        self.photo("first.png", color="blue")
+        wait_until(lambda: (engine.get_photos()[0].size, engine.get_photos()[0].mtime_ns)
+                   != (previous.size, previous.mtime_ns))
+        self.assertEqual(engine.get_photos()[0].status, "대기")
+        api.release.set()
+        wait_until(lambda: engine.get_photos()[0].confirmed)
+        self.assertEqual([call[0] for call in api.calls], ["first.png", "first.png"])
+        self.assertEqual(engine.get_photos()[0].error, "")
+        self.assertTrue(engine._auto)
+
+    def test_new_tagged_photo_skips_auto_while_original_is_processed(self):
+        engine = self.engine()
+        engine.set_auto(True)
+        tagged = self.photo(TAGGED_NAME)
+        original = self.photo("new.png")
+        wait_until(lambda: len(engine.get_photos()) == 2
+                   and all(photo.confirmed for photo in engine.get_photos()))
+        self.assertEqual([call[0] for call in self.api.calls], [original.name])
+        self.assertTrue(tagged.exists())
+        self.assertFalse(original.exists())
+        self.assertEqual(engine._known[tagged.name]["state"], "processed")
+
+    def test_offline_tagged_arrival_is_recognized_after_restart_without_api(self):
+        engine = self.engine()
+        engine.shutdown()
+        tagged = self.photo(TAGGED_NAME)
+        restarted = self.engine()
+        restarted.set_auto(True)
+        time.sleep(0.15)
+        self.assertTrue(restarted.get_photos()[0].confirmed)
+        self.assertTrue(tagged.exists())
+        self.assertEqual(self.api.calls, [])
+        restarted.shutdown()
+        reloaded = self.engine()
+        self.assertTrue(reloaded.get_photos()[0].confirmed)
+        self.assertEqual(reloaded.get_photos()[0].analysis, TAGGED_ANALYSIS)
+
+    def test_tagged_existing_manifest_baseline_is_updated_to_processed(self):
+        path = self.photo(TAGGED_NAME)
+        stat = path.stat()
+        (self.root / ".frametag_watch_v2.json").write_text(json.dumps({
+            "version": 2, "recursive": False, "entries": {
+                TAGGED_NAME: {"state": "baseline", "size": stat.st_size,
+                              "mtime_ns": stat.st_mtime_ns, "present": True}}}),
+            encoding="utf-8")
+        engine = self.engine()
+        self.assertTrue(engine.get_photos()[0].confirmed)
+        self.assertEqual(engine._known[TAGGED_NAME]["state"], "processed")
+        record = json.loads((self.root / ".frametag_watch_v2.json").read_text())
+        self.assertEqual(record["entries"][TAGGED_NAME]["state"], "processed")
+
+    def test_valid_unconfirmed_cache_takes_precedence_over_tagged_filename(self):
+        path = self.photo(TAGGED_NAME)
+        cached = Photo.from_path(path)
+        # A valid awaiting-analysis record can come from an earlier version or
+        # an undo. The filename heuristic must not replace that explicit state.
+        Cache(self.root).put(cached)
+        engine = self.engine()
+        self.assertFalse(engine.get_photos()[0].confirmed)
+        self.assertIsNone(engine.get_photos()[0].analysis)
+        self.assertEqual(engine.get_photos()[0].status, "대기")
+        engine.start_analysis()
+        self.idle(engine)
+        self.assertEqual([call[0] for call in self.api.calls], [TAGGED_NAME])
+        self.assertFalse(engine.get_photos()[0].confirmed)
+
+    def test_manual_edit_of_recognized_photo_survives_reload_and_undo(self):
+        path = self.photo(TAGGED_NAME)
+        engine = self.engine()
+        engine.update_photo(str(path), "clothing", "직접정한의상")
+        engine.shutdown()
+        restarted = self.engine()
+        photo = restarted.get_photos()[0]
+        self.assertFalse(photo.confirmed)
+        self.assertTrue(photo.manual)
+        self.assertEqual(photo.analysis["clothing"], ["직접정한의상"])
+        restarted.start_analysis()
+        self.idle(restarted)
+        self.assertEqual(self.api.calls, [])
+        restarted.apply_selected([str(path)])
+        self.assertTrue(restarted.get_photos()[0].confirmed)
+        restarted.undo()
+        self.assertTrue(path.exists())
+        self.assertFalse(restarted.get_photos()[0].confirmed)
+        restarted.shutdown()
+        reloaded = self.engine()
+        self.assertFalse(reloaded.get_photos()[0].confirmed)
+        self.assertEqual(reloaded.get_photos()[0].analysis["clothing"], ["직접정한의상"])
+
+    def test_replaced_tagged_file_ignores_stale_manual_cache_and_skips_api(self):
+        path = self.photo(TAGGED_NAME)
+        engine = self.engine()
+        engine.update_photo(str(path), "clothing", "이전사진의상")
+        self.assertTrue(engine.get_photos()[0].manual)
+        self.photo(TAGGED_NAME, color="blue")
+        wait_until(lambda: engine.get_photos()[0].confirmed)
+        self.assertFalse(engine.get_photos()[0].manual)
+        self.assertEqual(engine.get_photos()[0].analysis, TAGGED_ANALYSIS)
+        engine.start_analysis()
+        self.idle(engine)
+        self.assertEqual(self.api.calls, [])
 
     def test_baseline_untouched_new_photo_renamed_once(self):
         original = self.photo()

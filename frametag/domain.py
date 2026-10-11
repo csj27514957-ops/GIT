@@ -230,6 +230,71 @@ def filename_from_analysis(analysis: dict, suffix: str) -> str:
     return sanitize_filename(stem + suffix, suffix)
 
 
+def parse_frametag_filename(filename: str) -> dict | None:
+    """Recognize structured FrameTag names when their original cache is absent.
+
+    Require known color/clothing tokens or explicit object locations rather
+    than guessing from any gender-prefixed filename. Arbitrary manual names
+    and clothing remain unrecognized; their saved completion status is the
+    source of truth. Manual object vocabulary is kept exactly as written.
+    """
+    if not isinstance(filename, str):
+        return None
+    suffix = Path(filename).suffix
+    if suffix.lower() not in IMAGE_EXTENSIONS:
+        return None
+    try:
+        if sanitize_filename(filename, suffix) != filename:
+            return None
+    except ValueError:
+        return None
+
+    stem = filename[:-len(suffix)]
+    # Current releases use _2; older copies may use _(2) or Windows' (2).
+    collision = re.search(r"(?:_(\d+)|[ _]\((\d+)\))$", stem)
+    if collision and int(collision[1] or collision[2]) >= 2:
+        stem = stem[:collision.start()]
+    parts = stem.split("_")
+    if any(not part or part != _safe_component(part) for part in parts):
+        return None
+    gender = parts.pop(0)
+    if gender not in ("남성", "여성", "불명", "인물없음"):
+        return None
+    if not parts:
+        return ({"gender": gender, "clothing": [], "objects": []}
+                if gender in ("불명", "인물없음") else None)
+
+    clothing: list[str] = []
+    first = _clothing_item(parts[0])
+    if first:
+        color, garment = first
+        clothing.append(color + garment)
+        parts.pop(0)
+        if parts and (second := _clothing_item(parts[0])):
+            # A dress stands alone; ordinary output has top then bottom.
+            if garment not in TOPS or garment == "원피스" or second[1] not in BOTTOMS:
+                return None
+            clothing.append("".join(second))
+            parts.pop(0)
+
+    objects: list[str] = []
+    for part in parts:
+        if _clothing_item(part):
+            return None  # Additional/out-of-order clothing is ambiguous.
+        match = re.fullmatch(r"(손|바닥)-(.+)", part)
+        if match:
+            objects.append(f"{match[2]}({match[1]})")
+        elif clothing:
+            # The editor accepts object names without a location. Do not
+            # normalize them, including objects excluded by automatic AI rules.
+            objects.append(part)
+        else:
+            return None
+    if not clothing and not objects:
+        return None
+    return {"gender": gender, "clothing": clothing, "objects": objects}
+
+
 def _eligible(photo: Photo) -> bool:
     return (photo.analysis is not None and not photo.manual and not photo.confirmed
             and photo.status not in ("대기", "오류", "분석 중", "분석중", "분석 대기"))
