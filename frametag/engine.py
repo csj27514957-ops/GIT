@@ -432,6 +432,26 @@ class Engine:
                 photo = self._photos.get(identifier)
                 if photo is None or (photo.size, photo.mtime_ns) != (snapshot.size, snapshot.mtime_ns):
                     return "stale"
+                if config != self._config:
+                    # A request already sent keeps its original credentials.
+                    # Its failure must not pause work configured with a new key
+                    # or model, or overwrite an edit made while it was running.
+                    if photo.revision != snapshot.revision:
+                        return "edited"
+                    try:
+                        fingerprint = self._fingerprint(snapshot.path)
+                    except OSError:
+                        return "stale"
+                    if fingerprint != (snapshot.size, snapshot.mtime_ns):
+                        self._poll()
+                        return "stale"
+                    photo.status = snapshot.status if snapshot.status != "분석 중" else "대기"
+                    photo.error = snapshot.error
+                    cache.put(photo)
+                    self._mark(photo, "pending")
+                    self._publish()
+                    self._emit("status", "API 설정이 변경되어 이전 요청의 오류를 제외하고 사진을 대기 상태로 돌렸습니다.")
+                    return "reconfigured"
                 if photo.revision == snapshot.revision:
                     photo.status, photo.error = "오류", str(exc)
                     cache.put(photo)
@@ -453,6 +473,10 @@ class Engine:
             if self._cancel.is_set() or self._closed:
                 break
             result = self._process(identifier, automatic=False)
+            if result == "reconfigured" and not self._cancel.is_set() and not self._closed:
+                # Retry this photo once; repeated settings edits must not keep
+                # the rest of a manual batch waiting indefinitely.
+                result = self._process(identifier, automatic=False)
             if result in {"halt", "cancelled"}:
                 halted = result == "halt"
                 break

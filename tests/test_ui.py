@@ -153,7 +153,52 @@ class UITests(unittest.TestCase):
         self.assertNotIn("mock-openai-key-not-valid", settings_text)
         self.assertFalse(self.errors)
 
-    def test_retired_model_migrates_and_friendly_choices_save_actual_api_id(self):
+    def test_new_key_is_used_when_analysis_starts_before_save_debounce(self):
+        new_key = "mock-replacement-nvidia-key-not-valid"
+        captured = []
+
+        def factory(provider, model, key):
+            captured.append((provider, model, key))
+            return FakeAnalyzer(provider, model, key)
+
+        with patch.object(self.app.engine, "_factory", side_effect=factory):
+            self.app.api_key.set(new_key)
+            self.app._analyze()
+            self.wait(lambda: all(photo.analysis for photo in self.app.photos) and not self.app._busy)
+        self.assertEqual(len(captured), 3)
+        self.assertTrue(all(provider == "NVIDIA" and key == new_key
+                            for provider, _model, key in captured))
+        self.assertEqual(self.keys.get("NVIDIA"), new_key)
+        self.assertFalse(self.errors)
+
+    def test_model_discovery_uses_entered_key_before_save_debounce(self):
+        new_key = "mock-discovery-nvidia-key-not-valid"
+        with patch("frametag.ui.list_models", return_value=DEFAULT_MODELS["NVIDIA"]) as lookup:
+            self.app.api_key.set(new_key)
+            self.app._fetch_models()
+            self.wait(lambda: lookup.called and str(self.app.models_button["state"]) == "normal")
+        lookup.assert_called_once_with("NVIDIA", new_key)
+        self.assertFalse(self.errors)
+
+    def test_failed_key_persistence_still_updates_current_session_key(self):
+        old_key = self.app.api_key.get()
+        self.wait(lambda: self.app.engine._config[2] == old_key)
+        # Exercise the key-only debounce, without an unrelated settings save
+        # also configuring the engine and concealing a persistence failure.
+        if self.app._save_id:
+            self.app.after_cancel(self.app._save_id)
+            self.app._save_id = None
+        new_key = "mock-unsaved-nvidia-key-not-valid"
+        with patch.object(self.keys, "set", side_effect=RuntimeError("Credential store unavailable")) as save:
+            self.app.api_key.set(new_key)
+            self.wait(lambda: save.called and self.app.engine._config[2] == new_key)
+        save.assert_called_once_with("NVIDIA", new_key)
+        self.assertEqual(self.keys.get("NVIDIA"), old_key)
+        self.assertTrue(self.app._key_dirty)
+        self.assertNotIn(new_key, self.settings.path.read_text(encoding="utf-8"))
+        self.assertFalse(self.errors)
+
+    def test_legacy_model_migrates_and_friendly_choices_save_actual_api_id(self):
         self.app._save_settings()
         self.app._exit()
         saved = self.settings.load()
@@ -173,6 +218,90 @@ class UITests(unittest.TestCase):
         self.app._save_settings()
         self.assertEqual(self.settings.load()["models"]["NVIDIA"], available[1])
         self.assertFalse(self.errors)
+
+    def test_api_diagnostic_uses_new_key_and_gui_animates_while_server_waits(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        captured = []
+        report = "모델 목록 HTTP 200\n분석 경로 HTTP 410\n서버 설명: Inference route disabled"
+        def diagnostic(provider, model, key, cancel):
+            captured.append((provider, model, key, cancel))
+            entered.set()
+            release.wait(2)
+            return report
+        new_key = "mock-diagnostic-new-key-not-valid"
+        self.app.api_key.set(new_key)
+        with patch("frametag.ui.diagnose_connection", side_effect=diagnostic), \
+                patch.object(self.app, "_show_diagnostic") as show:
+            start = time.monotonic()
+            self.app._diagnose_api()
+            self.assertLess(time.monotonic() - start, .25)
+            self.wait(entered.is_set)
+            self.assertEqual(captured[0][:3], ("NVIDIA", self.app.model.get(), new_key))
+            self.assertTrue(self.app._diagnosing)
+            self.assertIn("진단 중", self.app.loading_text.get())
+            self.assertEqual(str(self.app.progress["mode"]), "indeterminate")
+            initial_progress = float(self.app.progress["value"])
+            heartbeat = []
+            self.app.after(30, lambda: heartbeat.append(True))
+            self.wait(lambda: bool(heartbeat), timeout=.5)
+            self.wait(lambda: float(self.app.progress["value"]) > initial_progress, timeout=.5)
+            self.assertFalse(release.is_set())
+            release.set()
+            self.wait(lambda: not self.app._diagnosing)
+            show.assert_called_once_with(report)
+        self.assertEqual(str(self.app.diagnostic_button["state"]), "normal")
+        self.assertEqual(self.app.loading_text.get(), "")
+        self.assertFalse(self.errors)
+
+    def test_old_key_discovery_cannot_change_model_after_key_is_replaced(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original_model = self.app.model.get()
+        def lookup(provider, key):
+            entered.set()
+            release.wait(2)
+            return [DEFAULT_MODELS["NVIDIA"][1]]
+        with patch("frametag.ui.list_models", side_effect=lookup):
+            self.app._fetch_models()
+            self.wait(entered.is_set)
+            self.app.api_key.set("mock-changed-during-discovery")
+            release.set()
+            self.wait(lambda: not self.app._models_pending)
+        self.assertEqual(self.app.model.get(), original_model)
+        self.assertIn("이전 모델 조회 결과", self.app.status.get())
+        self.assertFalse(self.errors)
+
+    def test_diagnostic_identifies_result_from_settings_changed_during_request(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def diagnostic(*args):
+            entered.set()
+            release.wait(2)
+            return "이전 설정의 진단 결과"
+        with patch("frametag.ui.diagnose_connection", side_effect=diagnostic), \
+                patch.object(self.app, "_show_diagnostic") as show:
+            self.app._diagnose_api()
+            self.wait(entered.is_set)
+            self.app.api_key.set("mock-changed-during-diagnostic")
+            release.set()
+            self.wait(lambda: not self.app._diagnosing)
+            self.assertIn("설정이 변경되었습니다", show.call_args.args[0])
+            self.assertIn("이전 설정의 진단 결과", show.call_args.args[0])
+
+    def test_diagnostic_result_dialog_copies_sanitized_report(self):
+        report = "HTTP 410\n서버 설명: Account route disabled\n[API 키 숨김]"
+        self.app._show_diagnostic(report)
+        dialog = next(widget for widget in self.app.winfo_children() if widget.winfo_class() == "Toplevel")
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        copy_button = next(widget for widget in descendants(dialog)
+                           if widget.winfo_class() == "TButton" and widget.cget("text") == "진단 결과 복사")
+        copy_button.invoke()
+        self.assertEqual(self.app.clipboard_get(), report)
+        dialog.destroy()
 
     def _hold_engine_lock(self):
         entered, release = threading.Event(), threading.Event()

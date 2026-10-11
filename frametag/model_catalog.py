@@ -22,7 +22,7 @@ MODEL_LABELS = {
     "OpenAI": {"gpt-4.1-mini": "GPT-4.1 mini · 사진 분석"},
 }
 DEFAULT_MODELS = {"NVIDIA": list(NVIDIA_PRESETS), "OpenAI": ["gpt-4.1-mini"]}
-RETIRED_NVIDIA_MODELS = {"nvidia/nemotron-nano-12b-v2-vl"}
+LEGACY_NVIDIA_MODELS = {"nvidia/nemotron-nano-12b-v2-vl"}
 
 
 def model_label(provider: str, model_id: str) -> str:
@@ -37,7 +37,7 @@ def model_id(provider: str, selection: str) -> str:
 
 def restore_model(provider: str, saved: str) -> str:
     identifier = model_id(provider, saved) if isinstance(saved, str) else ""
-    if not identifier or (provider == "NVIDIA" and identifier in RETIRED_NVIDIA_MODELS):
+    if not identifier or (provider == "NVIDIA" and identifier in LEGACY_NVIDIA_MODELS):
         return DEFAULT_MODELS[provider][0]
     return identifier
 

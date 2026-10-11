@@ -91,6 +91,28 @@ class EngineTests(unittest.TestCase):
     def idle(self, engine):
         wait_until(lambda: not engine._busy)
 
+    def _blocked_key_failure(self, old_key):
+        calls = []
+        self.api.release.clear()
+
+        def factory(provider, model, key):
+            outer = self
+
+            class Analyzer:
+                def analyze(self, path, cancel):
+                    calls.append((path.name, key))
+                    if key == old_key:
+                        outer.api.entered.set()
+                        while not outer.api.release.wait(.01):
+                            if cancel.is_set():
+                                raise Cancelled()
+                        raise APIError("Old configuration returned HTTP 410", fatal=True)
+                    return RESULT
+
+            return Analyzer()
+
+        return factory, calls
+
     def test_existing_tagged_filename_is_cached_confirmed_without_rename_history(self):
         path = self.photo(TAGGED_NAME)
         before = path.read_bytes()
@@ -705,6 +727,108 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(self.api.calls), 1)
         self.assertTrue(path.exists())
         self.assertEqual(restarted.get_photos()[0].model, "fake-model")
+
+    def test_old_key_failure_retries_manual_photo_with_new_key_and_finishes_batch(self):
+        self.photo("first.png")
+        self.photo("second.png")
+        old_key, new_key = "old-key-placeholder", "new-key-placeholder"
+        factory, calls = self._blocked_key_failure(old_key)
+        engine = self.engine(analyzer_factory=factory)
+        engine.configure("OpenAI", "fake-model", old_key)
+        engine.start_analysis()
+        self.assertTrue(self.api.entered.wait(2))
+        engine.configure("OpenAI", "fake-model", new_key)
+        self.api.release.set()
+        self.idle(engine)
+        self.assertEqual(calls, [("first.png", old_key), ("first.png", new_key),
+                                 ("second.png", new_key)])
+        self.assertTrue(all(photo.analysis and not photo.error
+                            and photo.status == "분석 완료" for photo in engine.get_photos()))
+        self.assertEqual(engine._consecutive_failures, 0)
+        self.assertFalse(any(kind == "error" for kind, _value in self.events))
+        snapshots = [value for kind, value in self.events if kind == "photos"]
+        self.assertTrue(any(photos[0].status == "대기" for photos in snapshots[1:]))
+
+    def test_old_key_failure_keeps_auto_enabled_and_renames_arrivals_with_new_key(self):
+        old_key, new_key = "old-key-placeholder", "new-key-placeholder"
+        factory, calls = self._blocked_key_failure(old_key)
+        engine = self.engine(analyzer_factory=factory)
+        engine.configure("OpenAI", "fake-model", old_key)
+        engine.set_auto(True)
+        first = self.photo("first.png")
+        first_contents = first.read_bytes()
+        self.assertTrue(self.api.entered.wait(2))
+        engine.configure("OpenAI", "fake-model", new_key)
+        second = self.photo("second.png", color="blue")
+        second_contents = second.read_bytes()
+        self.api.release.set()
+        wait_until(lambda: len(engine.get_photos()) == 2
+                   and all(photo.confirmed for photo in engine.get_photos())
+                   and not engine.is_busy())
+        self.assertEqual(calls, [("first.png", old_key), ("first.png", new_key),
+                                 ("second.png", new_key)])
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(sorted(photo.path.read_bytes() for photo in engine.get_photos()),
+                         sorted([first_contents, second_contents]))
+        self.assertTrue(engine._auto)
+        self.assertEqual(engine._consecutive_failures, 0)
+        self.assertFalse(any(kind == "error" or (kind == "auto" and value is False)
+                             for kind, value in self.events))
+
+    def test_old_key_failure_does_not_retry_or_overwrite_a_manual_edit(self):
+        path = self.photo()
+        old_key, new_key = "old-key-placeholder", "new-key-placeholder"
+        factory, calls = self._blocked_key_failure(old_key)
+        engine = self.engine(analyzer_factory=factory)
+        engine.configure("OpenAI", "fake-model", old_key)
+        engine.start_analysis()
+        self.assertTrue(self.api.entered.wait(2))
+        engine.update_photo(str(path), "clothing", "직접입력의상")
+        engine.configure("OpenAI", "fake-model", new_key)
+        self.api.release.set()
+        self.idle(engine)
+        photo = engine.get_photos()[0]
+        self.assertEqual(calls, [(path.name, old_key)])
+        self.assertEqual(photo.analysis["clothing"], ["직접입력의상"])
+        self.assertEqual(photo.status, "수동 수정")
+        self.assertTrue(photo.manual)
+        self.assertFalse(photo.error)
+        self.assertEqual(engine._known[path.name]["state"], "processed")
+        self.assertFalse(any(kind == "error" for kind, _value in self.events))
+
+    def test_manual_config_change_retry_is_bounded_to_one_per_photo(self):
+        self.photo("first.png")
+        self.photo("second.png")
+        calls = []
+
+        def factory(provider, model, key):
+            class Analyzer:
+                def analyze(_self, path, cancel):
+                    calls.append((path.name, key))
+                    next_key = {"first-key-placeholder": "second-key-placeholder",
+                                "second-key-placeholder": "third-key-placeholder"}.get(key)
+                    if next_key:
+                        engine.configure(provider, model, next_key)
+                        raise APIError("Old configuration returned HTTP 410", fatal=True)
+                    return RESULT
+
+            return Analyzer()
+
+        engine = self.engine(analyzer_factory=factory)
+        engine.configure("OpenAI", "fake-model", "first-key-placeholder")
+        engine.start_analysis()
+        self.idle(engine)
+        self.assertEqual(calls, [("first.png", "first-key-placeholder"),
+                                 ("first.png", "second-key-placeholder"),
+                                 ("second.png", "third-key-placeholder")])
+        photos = engine.get_photos()
+        self.assertEqual(photos[0].status, "대기")
+        self.assertIsNone(photos[0].analysis)
+        self.assertEqual(engine._known["first.png"]["state"], "pending")
+        self.assertTrue(photos[1].analysis)
+        self.assertEqual(engine._consecutive_failures, 0)
+        self.assertFalse(any(kind == "error" for kind, _value in self.events))
 
     def test_fatal_pauses_auto_and_error_does_not_repeat_after_restart(self):
         self.api.failure = APIError("API 권한 오류", fatal=True)

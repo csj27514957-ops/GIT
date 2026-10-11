@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import io
 import json
+import re
 import threading
 import warnings
 from pathlib import Path
@@ -18,7 +19,7 @@ import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .domain import normalize_analysis
-from .model_catalog import DEFAULT_MODELS, RETIRED_NVIDIA_MODELS, photo_models
+from .model_catalog import DEFAULT_MODELS, photo_models
 
 
 ENDPOINTS = {
@@ -66,9 +67,60 @@ objects의 location은 손 또는 바닥만 사용하세요.
 
 
 class APIError(Exception):
-    def __init__(self, message: str, fatal: bool = False):
+    def __init__(self, message: str, fatal: bool = False, *, status_code: int | None = None):
         super().__init__(message)
         self.fatal = fatal
+        self.status_code = status_code
+
+
+def _safe_detail(value: str, key: str, limit: int = 900) -> str:
+    """Bound server-controlled text and redact credentials or echoed image data."""
+    if key:
+        value = value.replace(key, "[API 키 숨김]")
+    value = re.sub(r"(?i)\b(?:nvapi-|sk-)[A-Za-z0-9_-]+", "[API 키 숨김]", value)
+    value = re.sub(r"(?i)\bBearer\s+[^\s\"'<>]+", "Bearer [API 키 숨김]", value)
+    # A server may wrap base64 at arbitrary columns. Conservatively remove
+    # through the enclosing quote/tag (or end of text), including newlines.
+    value = re.sub(r"(?i)data:[^\s\"'<>]*;base64,[^\"'<>]*", "[이미지 데이터 숨김]", value)
+    value = re.sub(r"(?i)data:[^\s\"'<>]*", "[이미지 데이터 숨김]", value)
+    value = re.sub(r"[A-Za-z0-9+/=_-]{160,}", "[긴 데이터 숨김]", value)
+    value = " ".join(value.split())
+    return value[:limit] + ("…" if len(value) > limit else "")
+
+
+def _server_detail(response: httpx.Response, key: str) -> str:
+    # Inspect only error descriptions, never whole JSON with echoed request fields.
+    try:
+        body = response.json()
+    except ValueError:
+        value = response.text[:64000]
+        value = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", value)
+        value = re.sub(r"<[^>]+>", " ", value)
+    else:
+        value = ""
+        if isinstance(body, dict):
+            error = body.get("error")
+            candidates = [body.get("message"), body.get("detail"), body.get("title")]
+            if isinstance(error, dict):
+                candidates = [error.get("message"), error.get("detail"), error.get("code")] + candidates
+            elif isinstance(error, str):
+                candidates.insert(0, error)
+            value = next((item for item in candidates if isinstance(item, str) and item), "")
+        elif isinstance(body, str):
+            value = body
+    return _safe_detail(value, key) or "서버 오류 설명이 없습니다."
+
+
+def _http_error(message: str, response: httpx.Response, key: str, *, fatal=False) -> APIError:
+    request = response.request
+    # Fixed destination, without query parameters; no request headers or body.
+    endpoint = str(request.url.copy_with(query=None, fragment=None))
+    details = [message, f"요청: {request.method} {endpoint}",
+               f"서버 설명: {_server_detail(response, key)}"]
+    request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
+    if request_id:
+        details.append("요청 ID: " + _safe_detail(request_id, key, 180))
+    return APIError("\n".join(details), fatal=fatal, status_code=response.status_code)
 
 
 class Cancelled(Exception):
@@ -226,19 +278,20 @@ def _request(
             if 200 <= status < 300:
                 return response
             if status in {401, 403}:
-                raise APIError(f"API 인증·권한 오류 ({status}). 키와 모델 권한을 확인하세요.", fatal=True)
+                raise _http_error(f"API 인증·권한 오류 ({status}). 키와 모델 권한을 확인하세요.", response, key, fatal=True)
             if status == 402:
-                raise APIError("API 결제·크레딧 오류 (402). 계정 한도를 확인하세요.", fatal=True)
+                raise _http_error("API 결제·크레딧 오류 (402). 계정 한도를 확인하세요.", response, key, fatal=True)
             if status == 404:
-                raise APIError("모델을 찾을 수 없습니다 (404). 모델 ID와 사용 권한을 확인하세요.", fatal=True)
+                raise _http_error("API 경로나 모델을 찾을 수 없습니다 (404). 모델 ID와 사용 권한을 확인하세요.", response, key, fatal=True)
             if status == 410:
-                raise APIError("선택한 모델의 API 제공이 종료되었거나 해당 경로가 폐쇄되었습니다 (410). "
-                               "모델 목록을 갱신하고 다른 사진 분석 모델을 선택하세요.", fatal=True)
+                raise _http_error("API가 요청을 거절했습니다 (410). 모델 제공 종료로 단정할 수 없습니다. "
+                                  "API 연결 진단에서 모델 목록과 분석 경로의 응답을 비교하세요.", response, key, fatal=True)
             if status not in RETRY_STATUSES:
-                raise APIError(f"API 요청 오류 ({status}). 모델의 이미지 지원 여부를 확인하세요.")
+                raise _http_error(f"API 요청 오류 ({status}). 서버 설명을 확인하세요.", response, key)
             if attempt == MAX_ATTEMPTS - 1:
-                raise APIError(
+                raise _http_error(
                     f"API 요청이 반복해서 실패했습니다 ({status}). 사용 한도와 서버 상태를 확인하세요.",
+                    response, key,
                     fatal=status == 429,
                 )
         if cancel.wait(_retry_delay(response, attempt)):
@@ -258,6 +311,17 @@ def _message_text(response: httpx.Response) -> str:
         raise APIError("API 서버의 분석 응답 형식을 읽을 수 없습니다.") from None
 
 
+def _generation_options(provider: str, model: str) -> dict[str, Any]:
+    if provider == "OpenAI":
+        return {"max_completion_tokens": 1200, "response_format": {"type": "json_object"}}
+    options: dict[str, Any] = {"max_tokens": 1600, "temperature": 0.1}
+    if model in {"qwen/qwen3.5-122b-a10b", "qwen/qwen3.5-397b-a17b"}:
+        options["chat_template_kwargs"] = {"enable_thinking": False}
+    elif model == "mistralai/mistral-small-4-119b-2603":
+        options["reasoning_effort"] = None
+    return options
+
+
 class Analyzer:
     def __init__(self, provider: str, model: str, key: str, transport: Any = None):
         self.provider = _provider_name(provider)
@@ -271,9 +335,6 @@ class Analyzer:
             raise APIError("선택한 공급자의 API 키를 입력하세요.", fatal=True)
         if not self.model:
             raise APIError("이미지 분석 모델 ID를 입력하세요.", fatal=True)
-        if self.provider == "NVIDIA" and self.model in RETIRED_NVIDIA_MODELS:
-            raise APIError("기존 Nemotron Nano 12B V2 VL 모델에서 제공 종료 오류가 확인되었습니다. "
-                           "Qwen 3.5 등 다른 사진 분석 모델을 선택하세요.", fatal=True)
         image_url = _image_url(Path(path), cancel)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": PROMPT},
@@ -284,16 +345,7 @@ class Analyzer:
         ]
         for correction in range(3):
             payload: dict[str, Any] = {"model": self.model, "messages": messages}
-            if self.provider == "OpenAI":
-                payload["max_completion_tokens"] = 1200
-                payload["response_format"] = {"type": "json_object"}
-            else:
-                payload["max_tokens"] = 1600
-                payload["temperature"] = 0.1
-                if self.model in {"qwen/qwen3.5-122b-a10b", "qwen/qwen3.5-397b-a17b"}:
-                    payload["chat_template_kwargs"] = {"enable_thinking": False}
-                elif self.model == "mistralai/mistral-small-4-119b-2603":
-                    payload["reasoning_effort"] = None
+            payload.update(_generation_options(self.provider, self.model))
             response = _request("POST", ENDPOINTS[self.provider] + "/chat/completions",
                                 self._key, cancel, payload, self._transport)
             content = _message_text(response)
@@ -331,6 +383,10 @@ def list_models(
         raise APIError("모델 목록을 조회하려면 해당 공급자의 API 키를 입력하세요.", fatal=True)
     response = _request("GET", ENDPOINTS[provider] + "/models", key.strip(), cancel,
                         transport=transport)
+    return photo_models(provider, _catalog_ids(response, cancel))
+
+
+def _catalog_ids(response: httpx.Response, cancel: threading.Event) -> list[str]:
     try:
         data = response.json()["data"]
         if not isinstance(data, list):
@@ -340,4 +396,50 @@ def list_models(
     except (ValueError, KeyError, TypeError):
         raise APIError("API 서버의 모델 목록 형식을 읽을 수 없습니다.") from None
     _check_cancel(cancel)
-    return photo_models(provider, result)
+    return result
+
+
+def diagnose_connection(
+    provider: str, model: str, key: str, cancel: threading.Event | None = None,
+    *, transport: Any = None,
+) -> str:
+    """Compare catalog and inference routes without reading or uploading photographs."""
+    provider = _provider_name(provider)
+    key, model = key.strip(), model.strip()
+    cancel = cancel if cancel is not None else threading.Event()
+    _check_cancel(cancel)
+    if not key or not model:
+        raise APIError("진단하려면 API 키와 모델 ID를 입력하세요.", fatal=True)
+    report = ["FrameTag API 연결 진단", f"공급자: {provider}",
+              "선택 모델: " + _safe_detail(model, key),
+              "사진·파일 경로·API 키는 진단 결과에 포함하지 않습니다.", ""]
+    base = ENDPOINTS[provider]
+    report.append(f"1. 모델 목록: GET {base}/models")
+    try:
+        response = _request("GET", base + "/models", key, cancel, transport=transport)
+        report.append(f"HTTP {response.status_code}")
+        available = _catalog_ids(response, cancel)
+    except APIError as exc:
+        report.append(str(exc))
+        if exc.status_code in {401, 402, 403, 429}:
+            report.append("인증·권한·한도 문제로 텍스트 요청을 생략했습니다.")
+            return "\n".join(report)
+    else:
+        report.append(f"선택 모델이 서버 목록에 {'있습니다' if model in available else '없습니다'}.")
+        candidates = photo_models(provider, available)
+        report.append("추천 사진 모델: " + (_safe_detail(", ".join(candidates), key) or "목록에 없음"))
+    report.extend(["", f"2. 분석 경로: POST {base}/chat/completions",
+                   "사진 없이 짧은 텍스트 요청을 보냅니다. API 사용량이 소량 발생할 수 있습니다."])
+    payload = {"model": model, "messages": [{"role": "user", "content": 'Reply with JSON: {"ok":true}'}]}
+    payload.update(_generation_options(provider, model))
+    payload["max_completion_tokens" if provider == "OpenAI" else "max_tokens"] = 32
+    try:
+        response = _request("POST", base + "/chat/completions", key, cancel, payload, transport)
+        report.append(f"HTTP {response.status_code}")
+        _message_text(response)
+    except APIError as exc:
+        report.append(str(exc))
+    else:
+        report.append("텍스트 응답을 받았습니다. 사진 입력과 분석 품질은 별도 확인이 필요합니다.")
+    _check_cancel(cancel)
+    return "\n".join(report)

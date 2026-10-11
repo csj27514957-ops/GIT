@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from . import __version__
-from .api import DEFAULT_MODELS, list_models
+from .api import APIError, Cancelled, DEFAULT_MODELS, diagnose_connection, list_models
 from .domain import is_gender_prefixed_filename, select_through
 from .model_catalog import model_id, model_label, restore_model
 from .engine import Engine
@@ -39,6 +39,10 @@ class FrameTagApp(tk.Tk):
         self._busy = False
         self._loading = False
         self._auto_pending = False
+        self._diagnosing = False
+        self._diagnostic_cancel = threading.Event()
+        self._api_revision = 0
+        self._models_pending = False
         self._loaded_folder = None
         self._closed = False
         self._tray = None
@@ -110,6 +114,7 @@ class FrameTagApp(tk.Tk):
         return list(defaults)
 
     def _model_changed(self, *args):
+        self._api_revision += 1
         label = model_label(self.provider.get(), self.model.get())
         if self.model_choice.get() != label:
             self.model_choice.set(label)
@@ -136,9 +141,10 @@ class FrameTagApp(tk.Tk):
         self._engine_pool.submit(run)
 
     def _update_loading_indicator(self):
-        active = self._loading or self._auto_pending
+        active = self._loading or self._auto_pending or self._diagnosing
         self.loading_text.set("로딩 중 · 사진 목록과 저장된 결과를 불러오고 있습니다." if self._loading else
-                              "처리 중 · 자동 감시 설정을 적용하고 있습니다." if self._auto_pending else "")
+                              "처리 중 · 자동 감시 설정을 적용하고 있습니다." if self._auto_pending else
+                              "API 연결 진단 중 · 서버 응답을 기다리고 있습니다." if self._diagnosing else "")
         if active and str(self.progress["mode"]) != "indeterminate":
             self.progress.configure(mode="indeterminate")
             self.progress.start(40)
@@ -176,7 +182,9 @@ class FrameTagApp(tk.Tk):
         self.browse_button.grid(row=0, column=2, padx=(0, 8))
         self.recursive_check = ttk.Checkbutton(header, text="하위 폴더 포함", variable=self.recursive,
                                                command=self._recursive_changed)
-        self.recursive_check.grid(row=0, column=3, columnspan=3, sticky="w")
+        self.recursive_check.grid(row=0, column=3, sticky="w")
+        self.diagnostic_button = ttk.Button(header, text="API 연결 진단", command=self._diagnose_api)
+        self.diagnostic_button.grid(row=0, column=4, padx=(5, 0))
         self.api_label = ttk.Label(header, text="NVIDIA API 키", style="Header.TLabel")
         self.api_label.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         self.key_entry = ttk.Entry(header, textvariable=self.api_key, show="●")
@@ -366,6 +374,7 @@ class FrameTagApp(tk.Tk):
         if self._loading_key or self._closed:
             return
         self._key_dirty = True
+        self._api_revision += 1
         self._provider_keys[self._active_provider] = self.api_key.get().strip()
         if self._key_save_id:
             self.after_cancel(self._key_save_id)
@@ -380,6 +389,9 @@ class FrameTagApp(tk.Tk):
             return not key or self._saved_keys.get(self._active_provider) == key
         key = self.api_key.get().strip()
         provider = self._active_provider
+        # Use the current entry for this session even if the credential store fails.
+        if self.provider.get() == provider:
+            self._configure_engine()
         try:
             if key:
                 self.key_store.set(provider, key)
@@ -390,11 +402,10 @@ class FrameTagApp(tk.Tk):
             return False
         self._saved_keys[provider] = key
         self._key_dirty = False
-        if self.provider.get() == self._active_provider:
-            self._configure_engine()
         return True
 
     def _provider_changed(self, event=None):
+        self._api_revision += 1
         self._save_key()
         self._models[self._active_provider] = self.model.get().strip()
         self._active_provider = self.provider.get()
@@ -409,18 +420,72 @@ class FrameTagApp(tk.Tk):
         self._dispatch_engine(self.engine.configure, self.provider.get(), self.model.get().strip(), self.api_key.get().strip())
 
     def _fetch_models(self):
+        if self._models_pending:
+            return
         provider, key = self.provider.get(), self.api_key.get().strip()
         if not key:
             messagebox.showinfo("모델 목록", "선택한 공급자의 API 키를 먼저 입력하세요.", parent=self)
             return
+        revision = self._api_revision
+        self._models_pending = True
         self.models_button.configure(state="disabled", text="모델 확인 중…")
         self.status.set("계정에서 사용할 수 있는 API 모델 목록을 가져오는 중입니다.")
         def fetch():
             try:
-                self.events.put(("models", (provider, list_models(provider, key))))
-            except Exception as exc:
-                self.events.put(("models_error", str(exc)))
+                self.events.put(("models", (revision, provider, list_models(provider, key))))
+            except APIError as exc:
+                self.events.put(("models_error", (revision, str(exc))))
+            except Exception:
+                self.events.put(("models_error", (revision, "모델 목록을 가져오지 못했습니다. API 설정과 연결을 확인하세요.")))
         threading.Thread(target=fetch, daemon=True, name="model-list").start()
+
+    def _diagnose_api(self):
+        if self._diagnosing:
+            return
+        provider, model, key = self.provider.get(), self.model.get().strip(), self.api_key.get().strip()
+        if not key or not model:
+            messagebox.showinfo("API 연결 진단", "API 키와 모델을 먼저 입력하세요.", parent=self)
+            return
+        revision = self._api_revision
+        self._diagnosing = True
+        self._diagnostic_cancel = threading.Event()
+        cancel = self._diagnostic_cancel
+        self.diagnostic_button.configure(state="disabled", text="진단 중…")
+        self._update_loading_indicator()
+        self.status.set("사진 전송 없이 모델 목록과 짧은 텍스트 요청을 확인합니다.")
+        def run():
+            try:
+                report = diagnose_connection(provider, model, key, cancel)
+            except Cancelled:
+                return
+            except APIError as exc:
+                report = str(exc)
+            except Exception:
+                report = "진단을 완료하지 못했습니다. API 공급자와 네트워크 상태를 확인하세요."
+            self.events.put(("diagnostic", (revision, report)))
+        threading.Thread(target=run, daemon=True, name="api-diagnostic").start()
+
+    def _show_diagnostic(self, report):
+        dialog = tk.Toplevel(self)
+        dialog.title("FrameTag API 연결 진단")
+        dialog.geometry("850x540")
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, wrap="word", font=("Segoe UI", 10))
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", report)
+        text.configure(state="disabled")
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(report)
+            self.status.set("키를 숨긴 API 진단 결과를 복사했습니다.")
+        buttons = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="진단 결과 복사", command=copy).pack(side="left")
+        ttk.Button(buttons, text="닫기", command=dialog.destroy).pack(side="right")
 
     def _browse(self):
         if self._busy or self._loading:
@@ -867,18 +932,33 @@ class FrameTagApp(tk.Tk):
                 self._update_buttons()
                 self.status.set(data)
             elif name == "models":
-                provider, models = data
+                revision, provider, models = data
+                self._models_pending = False
                 self.models_button.configure(state="normal", text="사용 가능한 모델 확인")
-                if provider == self.provider.get():
+                if revision == self._api_revision and provider == self.provider.get():
                     self.model_combo.configure(values=[model_label(provider, identifier) for identifier in models])
                     if models and self.model.get() not in models:
                         self.model.set(models[0])
                     self.status.set(f"계정 목록에서 사진 분석 후보 {len(models)}개를 확인했습니다." if models else
                                     "계정 목록에 추천 사진 모델이 없습니다. NVIDIA 계정의 모델 권한을 확인하세요.")
+                else:
+                    self.status.set("설정이 바뀌어 이전 모델 조회 결과를 적용하지 않았습니다. 다시 확인하세요.")
             elif name == "models_error":
+                revision, message = data
+                self._models_pending = False
                 self.models_button.configure(state="normal", text="사용 가능한 모델 확인")
-                self.status.set(data)
-                messagebox.showerror("모델 목록", data, parent=self)
+                if revision == self._api_revision:
+                    self.status.set(message)
+                    messagebox.showerror("모델 목록", message, parent=self)
+            elif name == "diagnostic":
+                revision, report = data
+                self._diagnosing = False
+                self.diagnostic_button.configure(state="normal", text="API 연결 진단")
+                self._update_loading_indicator()
+                if revision != self._api_revision:
+                    report = "진단 도중 설정이 변경되었습니다. 아래 결과는 진단을 시작할 때의 설정 기준입니다.\n\n" + report
+                self.status.set("API 진단이 끝났습니다. 결과 창에서 서버 설명을 확인하세요.")
+                self._show_diagnostic(report)
             elif name == "preview":
                 token, fingerprint, image = data
                 self._preview_cache[fingerprint] = image
@@ -948,6 +1028,7 @@ class FrameTagApp(tk.Tk):
         self._save_settings()
         self._closed = True
         self._engine_pool.shutdown(wait=False, cancel_futures=True)
+        self._diagnostic_cancel.set()
         self.progress.stop()
         for after_id in (self._poll_id, self._save_id, self._search_id, self._preview_id, self._key_save_id):
             if after_id:

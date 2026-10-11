@@ -12,7 +12,7 @@ from unittest.mock import patch
 import httpx
 from PIL import Image
 
-from frametag.api import Analyzer, APIError, Cancelled, _retry_delay, list_models
+from frametag.api import Analyzer, APIError, Cancelled, _retry_delay, diagnose_connection, list_models
 from frametag.model_catalog import DEFAULT_MODELS, model_id, model_label, restore_model
 
 
@@ -302,17 +302,159 @@ class APITests(unittest.TestCase):
                     self.photo, threading.Event())
                 self.assertEqual(result["gender"], "남성")
 
-    def test_retired_model_fails_before_upload_and_saved_selection_migrates(self):
-        retired = "nvidia/nemotron-nano-12b-v2-vl"
-        analyzer = Analyzer("NVIDIA", retired, "test-placeholder", transport=httpx.MockTransport(
-            lambda _: self.fail("Retired model must never upload a photo")))
-        with self.assertRaises(APIError) as caught:
-            analyzer.analyze(self.photo, threading.Event())
-        self.assertTrue(caught.exception.fatal)
-        self.assertEqual(restore_model("NVIDIA", retired), DEFAULT_MODELS["NVIDIA"][0])
+    def test_legacy_saved_selection_migrates_but_explicit_model_is_not_blocked(self):
+        legacy = "nvidia/nemotron-nano-12b-v2-vl"
+        requests = []
+        def handler(request):
+            requests.append(json.loads(request.content)["model"])
+            return reply()
+        analyzer = Analyzer("NVIDIA", legacy, "test-placeholder", transport=httpx.MockTransport(handler))
+        self.assertEqual(analyzer.analyze(self.photo, threading.Event())["gender"], "남성")
+        self.assertEqual(requests, [legacy])
+        self.assertEqual(restore_model("NVIDIA", legacy), DEFAULT_MODELS["NVIDIA"][0])
         for identifier in DEFAULT_MODELS["NVIDIA"]:
             self.assertEqual(model_id("NVIDIA", model_label("NVIDIA", identifier)), identifier)
         self.assertEqual(restore_model("OpenAI", "custom-vision-id"), "custom-vision-id")
+
+    def test_error_retains_server_reason_and_request_id_without_echoed_secrets(self):
+        key = "nvapi-dummy-private-value"
+        other_key = "sk-other-dummy-secret"
+        uri = "data:image/jpeg;base64," + "A" * 200
+        def handler(request):
+            return httpx.Response(410, json={"error": {"message":
+                f"Account route disabled. key={key}; other={other_key}; image={uri}"},
+                "request": {"Authorization": key, "messages": "private photo data"}},
+                headers={"x-request-id": "trace-test"})
+        with self.assertRaises(APIError) as caught:
+            Analyzer("NVIDIA", "test-model", key, transport=httpx.MockTransport(handler)).analyze(
+                self.photo, threading.Event())
+        message = str(caught.exception)
+        self.assertTrue(caught.exception.fatal)
+        self.assertEqual(caught.exception.status_code, 410)
+        self.assertIn("Account route disabled", message)
+        self.assertIn("POST https://integrate.api.nvidia.com/v1/chat/completions", message)
+        self.assertIn("trace-test", message)
+        self.assertIn("단정할 수 없습니다", message)
+        for private in (key, other_key, uri, "private photo data", "A" * 100):
+            self.assertNotIn(private, message)
+
+    def test_plain_text_and_html_errors_are_bounded_and_redacted(self):
+        key = "dummy-value-without-standard-prefix"
+        for content in (f"Gateway gone Bearer {key} data:image/jpeg;base64,AAAA " + "x" * 3000,
+                        f"<html><script>secret script</script><body>Gateway gone {key}</body></html>"):
+            with self.subTest(content=content[:30]):
+                def handler(request):
+                    return httpx.Response(410, text=content)
+                with self.assertRaises(APIError) as caught:
+                    Analyzer("NVIDIA", "test-model", key, transport=httpx.MockTransport(handler)).analyze(
+                        self.photo, threading.Event())
+                message = str(caught.exception)
+                self.assertIn("Gateway gone", message)
+                self.assertNotIn(key, message)
+                self.assertNotIn("secret script", message)
+                self.assertNotIn("data:image", message)
+                self.assertLess(len(message), 1500)
+
+    def test_wrapped_base64_error_is_hidden_in_copyable_diagnostic(self):
+        wrapped = "\n".join(["A" * 76, "B" * 76, "C" * 76])
+        def handler(request):
+            return httpx.Response(410, json={"error": {
+                "message": 'Image rejected: "data:image/jpeg;base64,\n' + wrapped + '" route disabled'}})
+        report = diagnose_connection("NVIDIA", "test-model", "test-placeholder",
+                                     transport=httpx.MockTransport(handler))
+        self.assertIn("Image rejected", report)
+        self.assertIn("route disabled", report)
+        self.assertIn("이미지 데이터 숨김", report)
+        for chunk in ("A" * 76, "B" * 76, "C" * 76, "data:image"):
+            self.assertNotIn(chunk, report)
+
+    def test_diagnostic_compares_catalog_and_inference_without_photo_data(self):
+        key = "nvapi-dummy-diagnostic-key"
+        model = DEFAULT_MODELS["NVIDIA"][0]
+        requests = []
+        def handler(request):
+            requests.append(request)
+            self.assertEqual(request.headers["Authorization"], "Bearer " + key)
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": model}]})
+            payload = json.loads(request.content)
+            self.assertEqual(payload["model"], model)
+            self.assertEqual(payload["max_tokens"], 32)
+            self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertIsInstance(payload["messages"][0]["content"], str)
+            self.assertNotIn("image_url", request.content.decode())
+            self.assertNotIn(str(self.photo), request.content.decode())
+            return httpx.Response(410, json={"error": {"message": "Inference route not available"}})
+        report = diagnose_connection("NVIDIA", model, key, transport=httpx.MockTransport(handler))
+        self.assertEqual([r.method for r in requests], ["GET", "POST"])
+        self.assertIn("HTTP 200", report)
+        self.assertIn("목록에 있습니다", report)
+        self.assertIn("410", report)
+        self.assertIn("Inference route not available", report)
+        self.assertNotIn(key, report)
+
+    def test_diagnostic_checks_inference_even_when_catalog_is_gone(self):
+        for inference_status in (200, 410):
+            with self.subTest(inference_status=inference_status):
+                calls = []
+                def handler(request):
+                    calls.append(request.method)
+                    if request.method == "GET":
+                        return httpx.Response(410, text="Catalog unavailable")
+                    return reply(status=inference_status)
+                report = diagnose_connection("NVIDIA", "custom-model", "test-placeholder",
+                                             transport=httpx.MockTransport(handler))
+                self.assertEqual(calls, ["GET", "POST"])
+                self.assertIn("Catalog unavailable", report)
+                if inference_status == 200:
+                    self.assertIn("텍스트 응답을 받았습니다", report)
+                    self.assertIn("별도 확인", report)
+                else:
+                    self.assertEqual(report.count("(410)"), 2)
+
+    def test_diagnostic_does_not_infer_after_auth_or_quota_failure(self):
+        for status in (401, 402, 403, 429):
+            with self.subTest(status=status):
+                requests = []
+                def handler(request):
+                    requests.append(request.method)
+                    return httpx.Response(status, json={"error": "Account restricted"},
+                                          headers={"Retry-After": "0"})
+                report = diagnose_connection("NVIDIA", "test-model", "test-placeholder",
+                                             transport=httpx.MockTransport(handler))
+                self.assertEqual(set(requests), {"GET"})
+                self.assertIn("생략", report)
+                self.assertIn("Account restricted", report)
+
+    def test_diagnostic_handles_malformed_catalog_but_tests_inference(self):
+        def handler(request):
+            return httpx.Response(200, json={"data": None}) if request.method == "GET" else reply()
+        report = diagnose_connection("NVIDIA", "test-model", "test-placeholder",
+                                     transport=httpx.MockTransport(handler))
+        self.assertIn("모델 목록 형식", report)
+        self.assertIn("텍스트 응답을 받았습니다", report)
+
+    def test_cancellation_interrupts_diagnostic_and_skips_second_route(self):
+        entered = threading.Event()
+        cancel = threading.Event()
+        calls = []
+        async def handler(request):
+            calls.append(request.method)
+            entered.set()
+            await asyncio.sleep(10)
+            return httpx.Response(200, json={"data": []})
+        def cancel_soon():
+            entered.wait(1)
+            cancel.set()
+        thread = threading.Thread(target=cancel_soon, daemon=True)
+        thread.start()
+        start = time.monotonic()
+        with self.assertRaises(Cancelled):
+            diagnose_connection("NVIDIA", "test-model", "test-placeholder", cancel,
+                                transport=httpx.MockTransport(handler))
+        thread.join(1)
+        self.assertLess(time.monotonic() - start, 1)
+        self.assertEqual(calls, ["GET"])
 
 
 if __name__ == "__main__":
