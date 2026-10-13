@@ -26,8 +26,12 @@ from .storage import Cache, atomic_json
 
 
 class Engine:
+    # Waits after the server reports overload, growing with each busy reply.
+    SERVER_BUSY_DELAYS = (30.0, 60.0, 120.0, 300.0)
+
     def __init__(self, callback: Callable[[str, Any], None], interval: float = 1.0,
-                 stable_scans: int = 3, analyzer_factory: Callable[..., Any] = Analyzer):
+                 stable_scans: int = 3, analyzer_factory: Callable[..., Any] = Analyzer,
+                 server_busy_delays: tuple[float, ...] | None = None):
         self._callback = callback
         self._interval = max(0.02, float(interval))
         self._stable_scans = max(2, int(stable_scans))
@@ -51,6 +55,9 @@ class Engine:
         self._last_poll = 0.0
         self._consecutive_failures = 0
         self._rename_failures = 0
+        self._busy_delays = tuple(server_busy_delays or self.SERVER_BUSY_DELAYS)
+        self._server_busy_streak = 0
+        self._retry_at = 0.0
         self._manifest_error = ""
         self._worker = threading.Thread(target=self._run, name="FrameTag-worker", daemon=True)
         self._watcher = threading.Thread(target=self._run_watch, name="FrameTag-watch", daemon=True)
@@ -203,6 +210,8 @@ class Engine:
             self._save_manifest()
         self._consecutive_failures = 0
         self._rename_failures = 0
+        self._server_busy_streak = 0
+        self._retry_at = 0.0
 
     def set_auto(self, enabled: bool, retry_failed: bool = False) -> None:
         """retry_failed: the user switched this on, so failed photos go first.
@@ -419,6 +428,7 @@ class Engine:
                     photo.status, photo.error, photo.model = "분석 완료", "", config[1]
                     cache.put(photo)
                 self._consecutive_failures = 0
+                self._server_busy_streak = 0
                 if automatic:
                     assert self._root is not None
                     # Analysis is cached before renaming. A restart can finish this without a second API call.
@@ -483,6 +493,22 @@ class Engine:
                     self._publish()
                     self._emit("status", "API 설정이 변경되어 이전 요청의 오류를 제외하고 사진을 대기 상태로 돌렸습니다.")
                     return "reconfigured"
+                if getattr(exc, "server_busy", False):
+                    # Nothing is wrong with this photo. Keep its previous state and
+                    # retry it after a growing wait instead of moving down the list.
+                    if photo.revision == snapshot.revision:
+                        photo.status = snapshot.status if snapshot.status != "분석 중" else "대기"
+                        photo.error = snapshot.error
+                        cache.put(photo)
+                        self._publish()
+                    delay = self._busy_delays[min(self._server_busy_streak, len(self._busy_delays) - 1)]
+                    self._server_busy_streak += 1
+                    self._retry_at = time.monotonic() + delay
+                    code = getattr(exc, "status_code", None)
+                    self._emit("status", f"NVIDIA 서버가 혼잡합니다{f' ({code})' if code else ''}. "
+                                         f"{delay:g}초 후 {snapshot.path.name}부터 다시 시도합니다. "
+                                         "기다리지 않으려면 분석 중지를 누르세요.")
+                    return "server_busy"
                 if photo.revision == snapshot.revision:
                     photo.status, photo.error = "오류", str(exc)
                     cache.put(photo)
@@ -521,6 +547,10 @@ class Engine:
                     break
                 continue
             result = self._process(identifier, automatic=False)
+            while result == "server_busy" and not self._closed:
+                if self._cancel.wait(max(0.0, self._retry_at - time.monotonic())):
+                    break
+                result = self._process(identifier, automatic=False)
             if result == "reconfigured" and not self._cancel.is_set() and not self._closed:
                 # Retry this photo once; repeated settings edits must not keep
                 # the rest of a manual batch waiting indefinitely.
@@ -574,6 +604,8 @@ class Engine:
                     self._manual_requested = False
                 elif self._busy:
                     continue
+                elif time.monotonic() < self._retry_at:
+                    continue  # The server asked us to back off; the photo stays queued.
                 else:
                     try:
                         identifier = self._ready_auto_photo() if self._auto else None

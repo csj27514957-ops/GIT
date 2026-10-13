@@ -986,5 +986,26 @@ class APITests(unittest.TestCase):
         self.assertIn("생략", report)
 
 
+    def test_overload_and_degraded_model_are_reported_as_server_busy(self):
+        overloaded = {"error": "ResourceExhausted: Worker local total request limit reached (16/16)"}
+        degraded = {"error": "Function id 'x': DEGRADED function cannot be invoked"}
+        cases = [(lambda request: httpx.Response(503, json=overloaded), True, 4),
+                 (lambda request: httpx.Response(400, json=degraded), True, 1),
+                 (lambda request: httpx.Response(400, json={"error": "bad image"}), False, 1)]
+        for respond, busy, attempts in cases:
+            with self.subTest(busy=busy, attempts=attempts):
+                calls = []
+
+                def handler(request, respond=respond):
+                    calls.append(request)
+                    return respond(request)
+
+                with patch("frametag.api._retry_delay", return_value=0):
+                    with self.assertRaises(APIError) as caught:
+                        self.analyzer(handler).analyze(self.photo, threading.Event())
+                self.assertEqual(caught.exception.server_busy, busy)
+                self.assertFalse(caught.exception.fatal)
+                self.assertEqual(len(calls), attempts)
+
 if __name__ == "__main__":
     unittest.main()

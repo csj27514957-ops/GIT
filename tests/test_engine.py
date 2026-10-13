@@ -1229,5 +1229,61 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(self.api.calls), 1)
         self.assertFalse((self.root / "new.png").exists())
 
+    def busy_factory(self, busy_calls):
+        """The server is overloaded for the first busy_calls requests."""
+        def factory(provider, model, key):
+            outer = self
+
+            class Analyzer:
+                def analyze(self, path, cancel):
+                    outer.api.calls.append((path.name, provider, model))
+                    if len(outer.api.calls) <= busy_calls:
+                        raise APIError("ResourceExhausted (16/16)", status_code=503, server_busy=True)
+                    return RESULT
+
+            return Analyzer()
+        return factory
+
+    def busy_engine(self, busy_calls, delays=(0.05,)):
+        engine = Engine(lambda kind, value: self.events.append((kind, value)), interval=0.03,
+                        stable_scans=3, analyzer_factory=self.busy_factory(busy_calls),
+                        server_busy_delays=delays)
+        self.engines.append(engine)
+        engine.configure("OpenAI", "fake-model", "test-placeholder")
+        engine.load_folder(self.root)
+        return engine
+
+    def test_server_overload_waits_and_retries_the_same_photo(self):
+        self.photo("a.png")
+        self.photo("b.png", color="blue")
+        engine = self.busy_engine(busy_calls=2)
+        engine.start_analysis()
+        self.idle(engine)
+        self.assertEqual([name for name, *_ in self.api.calls], ["a.png", "a.png", "a.png", "b.png"])
+        self.assertEqual({photo.status for photo in engine.get_photos()}, {"분석 완료"})
+        self.assertEqual(engine._consecutive_failures, 0)
+        self.assertTrue(any(kind == "status" and "혼잡" in value for kind, value in self.events))
+        self.assertFalse(any(kind == "error" for kind, _value in self.events))
+
+    def test_auto_mode_waits_out_server_overload_without_marking_errors(self):
+        engine = self.busy_engine(busy_calls=3)
+        engine.set_auto(True, retry_failed=True)
+        self.photo("a.png")
+        wait_until(lambda: engine.get_photos() and engine.get_photos()[0].confirmed, timeout=5)
+        self.assertEqual([name for name, *_ in self.api.calls], ["a.png"] * 4)
+        self.assertTrue(engine._auto)
+        self.assertFalse(any(kind == "error" for kind, _value in self.events))
+
+    def test_stopping_during_an_overload_wait_leaves_the_photo_waiting(self):
+        self.photo("a.png")
+        engine = self.busy_engine(busy_calls=99, delays=(30.0,))
+        engine.start_analysis()
+        wait_until(lambda: any(kind == "status" and "혼잡" in value for kind, value in self.events))
+        engine.stop_analysis()
+        self.idle(engine)
+        photo = engine.get_photos()[0]
+        self.assertEqual((photo.status, photo.error), ("대기", ""))
+        self.assertEqual(len(self.api.calls), 1)
+
 if __name__ == "__main__":
     unittest.main()

@@ -83,8 +83,11 @@ objects의 location은 손 또는 바닥만 사용하세요.
 class APIError(Exception):
     def __init__(self, message: str, fatal: bool = False, *, status_code: int | None = None,
                  model_retired: str = "", retired_models: list[str] | None = None,
-                 transport_kind: str = ""):
+                 transport_kind: str = "", server_busy: bool = False):
         super().__init__(message)
+        # The server is overloaded or the model is temporarily degraded: the
+        # photo is fine and the same request can succeed later.
+        self.server_busy = server_busy
         self.fatal = fatal
         self.status_code = status_code
         self.model_retired = model_retired
@@ -139,7 +142,7 @@ def _server_detail(response: httpx.Response, key: str) -> str:
 
 
 def _http_error(message: str, response: httpx.Response, key: str, *, fatal=False,
-                model_retired="") -> APIError:
+                model_retired="", server_busy=False) -> APIError:
     request = response.request
     # Fixed destination, without query parameters; no request headers or body.
     endpoint = str(request.url.copy_with(query=None, fragment=None))
@@ -149,7 +152,7 @@ def _http_error(message: str, response: httpx.Response, key: str, *, fatal=False
     if request_id:
         details.append("요청 ID: " + _safe_detail(request_id, key, 180))
     return APIError("\n".join(details), fatal=fatal, status_code=response.status_code,
-                    model_retired=model_retired)
+                    model_retired=model_retired, server_busy=server_busy)
 
 
 def _transport_error(error: httpx.TransportError, method: str, url: str,
@@ -376,12 +379,18 @@ def _request(
                            "API 연결 진단에서 모델 목록과 분석 경로의 응답을 비교하세요.")
                 raise _http_error(message, response, key, fatal=True, model_retired=retired)
             if status not in RETRY_STATUSES:
-                raise _http_error(f"API 요청 오류 ({status}). 서버 설명을 확인하세요.", response, key)
+                # NVIDIA reports a temporarily unhealthy model deployment as 400.
+                degraded = status == 400 and "degraded function" in _server_detail(response, key).casefold()
+                raise _http_error(
+                    "NVIDIA가 이 모델을 일시적으로 사용할 수 없는 상태로 표시했습니다 (400)." if degraded
+                    else f"API 요청 오류 ({status}). 서버 설명을 확인하세요.",
+                    response, key, server_busy=degraded)
             if attempt == attempts - 1:
                 raise _http_error(
                     f"API 요청이 반복해서 실패했습니다 ({status}). 사용 한도와 서버 상태를 확인하세요.",
                     response, key,
                     fatal=status == 429,
+                    server_busy=status in {502, 503, 504},
                 )
         if cancel.wait(_retry_delay(response, attempt)):
             raise Cancelled()
