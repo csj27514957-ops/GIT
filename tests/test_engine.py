@@ -20,7 +20,7 @@ RESULT = {"gender": "남성", "clothing": ["검정반팔", "파랑청바지"],
           "objects": [{"name": "가방", "location": "손"}]}
 TAGGED_NAME = "여성_흰색반팔_검정반바지_손-종이 (2).png"
 TAGGED_ANALYSIS = {"gender": "여성", "clothing": ["흰색반팔", "검정반바지"],
-                   "objects": ["종이(손)"]}
+                   "objects": ["종이"]}
 
 
 def wait_until(predicate, timeout=3.0):
@@ -1284,6 +1284,63 @@ class EngineTests(unittest.TestCase):
         photo = engine.get_photos()[0]
         self.assertEqual((photo.status, photo.error), ("대기", ""))
         self.assertEqual(len(self.api.calls), 1)
+
+    def location_folder(self):
+        names = {
+            "여성_노랑후드_손-꽃.png": "red", "여성_노랑후드_바닥-꽃.png": "blue",
+            "남성_검정반팔_손-가방_바닥-가방_2.png": "green", "여성_교복_곰인형.png": "white",
+            "여성_노랑후드_꽃.png": "yellow",
+        }
+        for name, color in names.items():
+            self.photo(name, color=color)
+        return {name: (self.root / name).read_bytes() for name in names}
+
+    def test_location_markers_are_removed_in_one_undoable_rename(self):
+        contents = self.location_folder()
+        self.photo("pending.png", color="purple")
+        engine = self.engine()
+        pending = str((self.root / "pending.png").resolve())
+        with engine._lock:
+            photo = engine._photos[pending]
+            photo.analysis = {"gender": "여성", "clothing": ["검정자켓"], "objects": ["우산(손)", "모자"]}
+            photo.proposed_name, photo.status = "여성_검정자켓_손-우산_모자.png", "분석 완료"
+        self.assertEqual(engine.location_marker_count(), (3, 1))
+        engine.strip_object_locations()
+        names = sorted(path.name for path in self.root.glob("*.png"))
+        self.assertEqual(names, sorted(["여성_노랑후드_꽃.png", "여성_노랑후드_꽃_2.png", "여성_노랑후드_꽃_3.png",
+                                        "남성_검정반팔_가방.png", "여성_교복_곰인형.png", "pending.png"]))
+        # The existing file keeps its name; the converted ones are numbered after it.
+        self.assertEqual((self.root / "여성_노랑후드_꽃.png").read_bytes(), contents["여성_노랑후드_꽃.png"])
+        # Converted in filename order: 바닥-꽃 sorts before 손-꽃.
+        self.assertEqual((self.root / "여성_노랑후드_꽃_2.png").read_bytes(), contents["여성_노랑후드_바닥-꽃.png"])
+        self.assertEqual((self.root / "여성_노랑후드_꽃_3.png").read_bytes(), contents["여성_노랑후드_손-꽃.png"])
+        self.assertEqual((self.root / "남성_검정반팔_가방.png").read_bytes(),
+                         contents["남성_검정반팔_손-가방_바닥-가방_2.png"])
+        photos = {photo.path.name: photo for photo in engine.get_photos()}
+        self.assertEqual(photos["남성_검정반팔_가방.png"].analysis["objects"], ["가방"])
+        self.assertEqual(photos["pending.png"].analysis["objects"], ["우산", "모자"])
+        self.assertEqual(photos["pending.png"].proposed_name, "여성_검정자켓_우산_모자.png")
+        self.assertEqual(engine.location_marker_count(), (0, 0))
+        restarted = self.engine()
+        self.assertEqual({p.path.name: p.proposed_name for p in restarted.get_photos()}["pending.png"],
+                         "여성_검정자켓_우산_모자.png")
+        restarted.undo()
+        self.assertEqual(sorted(path.name for path in self.root.glob("*.png")),
+                         sorted(list(contents) + ["pending.png"]))
+        for name, data in contents.items():
+            self.assertEqual((self.root / name).read_bytes(), data)
+        self.assertFalse(any(kind == "error" for kind, _value in self.events))
+
+    def test_failed_location_removal_changes_nothing(self):
+        contents = self.location_folder()
+        engine = self.engine()
+        before = {photo.path.name: photo.analysis for photo in engine.get_photos()}
+        with patch("frametag.engine.apply_names", side_effect=RenameError("locked")):
+            engine.strip_object_locations()
+        self.assertEqual({path.name: path.read_bytes() for path in self.root.glob("*.png")}, contents)
+        self.assertEqual({photo.path.name: photo.analysis for photo in engine.get_photos()}, before)
+        self.assertTrue(any(kind == "error" and "locked" in value for kind, value in self.events))
+        self.assertFalse(engine.is_busy())
 
 if __name__ == "__main__":
     unittest.main()

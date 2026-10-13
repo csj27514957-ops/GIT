@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageOps, ImageTk
 from . import __version__
 from .api import (APIError, Cancelled, ModelDiscovery,
                   _safe_detail, diagnose_connection, discover_photo_models, list_models)
-from .domain import is_gender_prefixed_filename, select_through
+from .domain import is_gender_prefixed_filename, select_through, strip_location_markers, strip_objects
 from .model_catalog import DEFAULT_MODELS, RETIRED_NVIDIA_MODELS, model_id, model_label, restore_model
 from .engine import Engine
 from .models import Photo
@@ -279,6 +279,8 @@ class FrameTagApp(tk.Tk):
                         command=self._schedule_save).pack(side="left")
         ttk.Checkbutton(monitor, text="이름 변경 완료 사진도 표시", variable=self.show_completed,
                         command=self._completed_filter_changed).pack(side="left", padx=(15, 0))
+        self.strip_button = ttk.Button(monitor, text="정물 손·바닥 표기 지우기", command=self._strip_locations)
+        self.strip_button.pack(side="left", padx=(15, 0))
         ttk.Button(monitor, text="백그라운드로 숨기기", command=self._hide).pack(side="right", padx=(5, 0))
         ttk.Button(monitor, text="완전히 종료", command=self._exit).pack(side="right")
 
@@ -985,6 +987,29 @@ class FrameTagApp(tk.Tk):
         if messagebox.askyesno("마지막 변경 되돌리기", "이 폴더의 마지막 파일명 변경을 되돌릴까요?", parent=self):
             self._run_file_action(self.engine.undo)
 
+    def _strip_locations(self):
+        if not self._folder_matches():
+            messagebox.showinfo("사진 폴더", "입력한 폴더의 목록을 먼저 불러오세요.", parent=self)
+            return
+        files = sum(1 for p in self.photos if strip_location_markers(p.path.name))
+        rows = sum(1 for p in self.photos if not strip_location_markers(p.path.name)
+                   and (strip_objects(p.analysis) is not None
+                        or (p.proposed_name and strip_location_markers(p.proposed_name))))
+        if not files and not rows:
+            messagebox.showinfo("정물 손·바닥 표기 지우기", "손·바닥 위치 표기가 있는 사진이 없습니다.", parent=self)
+            return
+        message = []
+        if files:
+            message.append(f"파일 이름에 손-/바닥- 표기가 있는 사진 {files:,}장의 이름을 바꿉니다. "
+                           "예: 여성_노랑후드_손-꽃.JPG → 여성_노랑후드_꽃.JPG")
+            message.append("같은 이름이 생기면 _2, _3처럼 번호를 붙이며 기존 파일을 덮어쓰지 않습니다. "
+                           "'마지막 변경 되돌리기'로 한 번에 되돌릴 수 있습니다.")
+        if rows:
+            message.append(f"아직 이름을 적용하지 않은 {rows:,}장은 분석 결과와 새 파일명에서만 위치를 지웁니다.")
+        message.append("진행할까요?")
+        if messagebox.askyesno("정물 손·바닥 표기 지우기", "\n\n".join(message), parent=self):
+            self._run_file_action(self.engine.strip_object_locations)
+
     def _run_file_action(self, action, *args):
         if self._busy or self._loading:
             return
@@ -1002,7 +1027,7 @@ class FrameTagApp(tk.Tk):
     def _update_buttons(self):
         unavailable = self._busy or self._loading or self._auto_pending
         for widget in (self.load_button, self.browse_button, self.apply_button, self.undo_button,
-                       self.folder_entry, self.recursive_check):
+                       self.strip_button, self.folder_entry, self.recursive_check):
             widget.configure(state="disabled" if unavailable else "normal")
         self.analyze_button.configure(state="disabled" if unavailable else "normal")
         self.stop_button.configure(state="normal" if self._busy else "disabled")

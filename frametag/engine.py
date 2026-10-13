@@ -19,7 +19,8 @@ from PIL import Image
 from .api import APIError, Analyzer, Cancelled
 from .domain import (filename_from_analysis, is_gender_prefixed_filename, list_images, natural_key,
                      normalize_analysis, parse_frametag_filename,
-                     sanitize_filename, select_through, status_rank, unify_runs)
+                     sanitize_filename, select_through, status_rank, strip_location_markers,
+                     strip_objects, unify_runs)
 from .models import Photo
 from .rename import apply_names, recover_pending, recovery_pending, undo_last
 from .storage import Cache, atomic_json
@@ -751,6 +752,83 @@ class Engine:
                 self._publish()
             except Exception as exc:
                 self._emit("error", f"파일명 변경 오류: {exc}")
+            finally:
+                self._busy = False
+                self._emit("busy", False)
+        self._wake.set()
+
+    def location_marker_count(self) -> tuple[int, int]:
+        """(files whose name has 손-/바닥-, other rows whose results mention a location)."""
+        with self._lock:
+            files = sum(1 for p in self._photos.values() if strip_location_markers(p.path.name))
+            rows = sum(1 for p in self._photos.values() if not strip_location_markers(p.path.name)
+                       and (strip_objects(p.analysis) is not None
+                            or (p.proposed_name and strip_location_markers(p.proposed_name))))
+            return files, rows
+
+    def strip_object_locations(self) -> None:
+        """Remove 손-/바닥- from existing filenames and saved results.
+
+        Files are renamed in one no-clobber transaction, so a single
+        "마지막 변경 되돌리기" restores every name. Rows not yet renamed only
+        have their analysis and suggested name updated.
+        """
+        with self._lock:
+            if self._busy or self._closed:
+                self._emit("error", "분석이나 파일 변경이 끝난 후 다시 시도하세요.")
+                return
+            if self._root is None or self._cache is None:
+                self._emit("error", "먼저 사진 폴더를 선택하세요.")
+                return
+            self._busy = True
+            self._emit("busy", True)
+            originals: dict[str, Photo] = {}
+            try:
+                renames: list[Photo] = []
+                updated: list[Photo] = []
+                for photo in sorted(self._photos.values(), key=lambda p: (
+                        natural_key(str(p.path.parent)), natural_key(p.path.name))):
+                    new_name = strip_location_markers(photo.path.name)
+                    analysis = strip_objects(photo.analysis)
+                    proposed = photo.proposed_name and strip_location_markers(photo.proposed_name)
+                    if not (new_name or analysis is not None or proposed):
+                        continue
+                    originals[str(photo.path)] = copy.deepcopy(photo)
+                    if analysis is not None:
+                        photo.analysis = analysis
+                    if new_name:
+                        photo.proposed_name = new_name
+                        renames.append(photo)
+                        continue
+                    if proposed:
+                        photo.proposed_name = (proposed if photo.manual or photo.analysis is None
+                                               else filename_from_analysis(photo.analysis, photo.path.suffix))
+                    photo.revision += 1
+                    updated.append(photo)
+                if not originals:
+                    self._emit("status", "손·바닥 위치 표기가 있는 사진이 없습니다.")
+                    return
+                if renames:
+                    self._emit("status", f"사진 {len(renames):,}장의 이름에서 위치 표기를 지우는 중입니다. "
+                                         "사진 수에 따라 몇 분 걸릴 수 있습니다.")
+                pairs = apply_names(self._root, renames, self._cache)
+                self._remap(pairs)
+                for photo in renames:
+                    self._known[self._key(photo.path)] = self._record(photo, "processed")
+                self._save_manifest()
+                if updated:
+                    self._cache.put_many(updated)
+                self._emit("status", f"위치 표기를 지웠습니다. 파일 이름 {len(pairs):,}장, "
+                                     f"분석 결과만 {len(updated):,}장. "
+                                     "파일 이름은 마지막 변경 되돌리기로 한 번에 되돌릴 수 있습니다.")
+                self._publish()
+            except Exception as exc:
+                # Nothing was renamed: apply_names restores every file on failure.
+                for identifier, photo in originals.items():
+                    if identifier in self._photos:
+                        self._photos[identifier] = photo
+                self._publish()
+                self._emit("error", f"위치 표기 제거 오류: {exc}")
             finally:
                 self._busy = False
                 self._emit("busy", False)

@@ -154,6 +154,8 @@ def normalize_analysis(raw: dict) -> dict:
                     break
 
     objects: list[str] = []
+    # Locations are no longer recorded. A model may still report one; it is
+    # only used to drop furniture and footwear lying on the floor.
     locations = {"손": "손", "hand": "손", "held": "손", "손에": "손",
                  "바닥": "바닥", "floor": "바닥", "ground": "바닥"}
     name_aliases = {"콜라병": "페트병", "음료병": "페트병", "생수병": "페트병", "플라스틱병": "페트병",
@@ -167,21 +169,16 @@ def normalize_analysis(raw: dict) -> dict:
             location = locations.get(_token(item.get("location", item.get("위치"))), "")
         elif isinstance(item, str):
             match = re.fullmatch(r"\s*(.+?)\s*\((손|바닥|hand|floor|ground)\)\s*", item, re.I)
-            if not match:
-                continue
-            name, location_text = match.groups()
-            location = locations.get(_token(location_text), "")
+            name, location = (match[1], locations.get(_token(match[2]), "")) if match else (item.strip(), "")
         else:
             continue
         name = name_aliases.get(_token(name), name)
-        if not name or _token(name) in ("없음", "none", "-", "unknown") or not location:
+        if not name or _token(name) in ("없음", "none", "-", "unknown"):
             continue
         if location == "바닥" and name in ("의자", "종이", "신문", "매트", "신발", "휴대폰"):
             continue
-        value = f"{name}({location})"
-        if value not in objects:
-            objects.append(value)
-    objects.sort(key=lambda value: (0 if value.endswith("(손)") else 1, natural_key(value)))
+        if name not in objects:
+            objects.append(name)
     if gender == "인물없음":
         objects = []
     return {"gender": gender, "clothing": clothing, "objects": objects}
@@ -214,6 +211,58 @@ def sanitize_filename(name: str, suffix: str) -> str:
     return result
 
 
+_LOCATION_PART = re.compile(r"(손|바닥)-(.+)")
+_LOCATION_SUFFIX = re.compile(r"\s*\((?:손|바닥)\)\s*$")
+
+
+def strip_object_location(value: Any) -> str:
+    """'꽃(손)' -> '꽃'. Objects no longer record where they are."""
+    return _LOCATION_SUFFIX.sub("", str(value or "")).strip()
+
+
+def strip_objects(analysis: dict | None) -> dict | None:
+    """The analysis without object locations, or None when there were none."""
+    if not analysis:
+        return None
+    objects = _array(analysis.get("objects", []))
+    stripped: list[str] = []
+    for value in objects:
+        name = strip_object_location(value.get("name", "") if isinstance(value, dict) else value)
+        if name and name not in stripped:
+            stripped.append(name)
+    if stripped == objects:
+        return None
+    return {**analysis, "objects": stripped}
+
+
+def strip_location_markers(filename: str) -> str | None:
+    """'여성_노랑후드_손-꽃_2.jpg' -> '여성_노랑후드_꽃.jpg', or None without markers.
+
+    Collision numbers are dropped so the rename can number the results
+    afresh; the rename never replaces an existing file.
+    """
+    suffix = Path(filename).suffix
+    stem = filename[:-len(suffix)] if suffix else filename
+    stem = re.sub(r"[ _]\(\d+\)$", "", stem)
+    parts = stem.split("_")
+    if not any(_LOCATION_PART.fullmatch(part) for part in parts):
+        return None
+    if len(parts) > 1 and parts[-1].isdigit() and int(parts[-1]) >= 2:
+        parts.pop()
+    result: list[str] = []
+    for part in parts:
+        match = _LOCATION_PART.fullmatch(part)
+        if match:
+            if match[2] in result:
+                continue
+            part = match[2]
+        result.append(part)
+    try:
+        return sanitize_filename("_".join(result) + suffix, suffix)
+    except ValueError:
+        return None
+
+
 def _safe_component(value: Any) -> str:
     # Manual vocabulary remains unchanged in the analysis/cache; filenames
     # omit whitespace, as documented for the original application's editor.
@@ -225,12 +274,12 @@ def filename_from_analysis(analysis: dict, suffix: str) -> str:
     suffix = _extension(suffix)
     parts = [str(analysis.get("gender", "불명"))]
     parts.extend(str(value) for value in _array(analysis.get("clothing", [])))
+    objects: list[str] = []
     for value in _array(analysis.get("objects", [])):
-        if isinstance(value, dict):
-            name, location = value.get("name", ""), value.get("location", "")
-            value = f"{name}({location})" if location else str(name)
-        match = re.fullmatch(r"\s*(.+?)\s*\((손|바닥)\)\s*", str(value))
-        parts.append(f"{match[2]}-{match[1]}" if match else str(value))
+        name = strip_object_location(value.get("name", "") if isinstance(value, dict) else value)
+        if name and name not in objects:
+            objects.append(name)
+    parts.extend(objects)
     stem = "_".join(part for part in map(_safe_component, parts) if part) or "사진"
     if _DEVICE.match(stem):
         stem = "사진_" + stem
@@ -290,9 +339,11 @@ def parse_frametag_filename(filename: str) -> dict | None:
     for part in parts:
         if _clothing_item(part):
             return None  # Additional/out-of-order clothing is ambiguous.
-        match = re.fullmatch(r"(손|바닥)-(.+)", part)
+        match = _LOCATION_PART.fullmatch(part)
         if match:
-            objects.append(f"{match[2]}({match[1]})")
+            # Names written before 2.0.10 carry a 손-/바닥- location marker.
+            if match[2] not in objects:
+                objects.append(match[2])
         elif clothing:
             # The editor accepts object names without a location. Do not
             # normalize them, including objects excluded by automatic AI rules.

@@ -902,5 +902,18 @@ class UITests(unittest.TestCase):
         self.assertEqual(str(label.cget("font")), "TkDefaultFont")
         label.destroy()
 
+    def test_location_marker_button_renames_after_confirmation(self):
+        for path in list(self.folder.glob("*.jpg")):
+            path.rename(path.with_name("여성_노랑후드_손-" + path.stem + ".jpg"))
+        self.app._load_folder()
+        self.wait(lambda: not self.app._loading and all("손-" in p.path.name for p in self.app.photos))
+        self.app._strip_locations()
+        self.wait(lambda: not self.app._busy and self.app.photos
+                  and not any("손-" in p.path.name for p in self.app.photos))
+        self.assertEqual(sorted(path.name for path in self.folder.glob("*.jpg")),
+                         ["여성_노랑후드_photo1.jpg", "여성_노랑후드_photo2.jpg", "여성_노랑후드_photo3.jpg"])
+        self.assertEqual(str(self.app.strip_button["state"]), "normal")
+        self.assertFalse(self.errors)
+
 if __name__ == "__main__":
     unittest.main()

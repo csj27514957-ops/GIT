@@ -1007,5 +1007,12 @@ class APITests(unittest.TestCase):
                 self.assertFalse(caught.exception.fatal)
                 self.assertEqual(len(calls), attempts)
 
+    def test_prompt_records_worn_extras_as_objects_without_location(self):
+        from frametag.api import PROMPT
+        self.assertIn("모자, 목도리", PROMPT)
+        self.assertIn("clothing이 아니라 objects", PROMPT)
+        self.assertIn("위치(손, 바닥 등)를 쓰지 말고", PROMPT)
+        self.assertNotIn('"location"', PROMPT)
+
 if __name__ == "__main__":
     unittest.main()

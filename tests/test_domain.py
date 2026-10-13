@@ -4,7 +4,8 @@ from pathlib import Path
 
 from frametag.domain import (
     filename_from_analysis, is_gender_prefixed_filename, list_images, natural_key, normalize_analysis,
-    parse_frametag_filename, sanitize_filename, select_through, unify_runs,
+    parse_frametag_filename, sanitize_filename, select_through, strip_location_markers, strip_objects,
+    unify_runs,
 )
 from frametag.models import Photo
 
@@ -46,7 +47,8 @@ class AnalysisTests(unittest.TestCase):
             {"name": name, "location": "바닥"} for name in ("의자", "종이", "신문", "매트", "신발", "휴대폰")
         ] + [{"name": "휴대폰", "location": "손"}, {"name": "생수병", "location": "floor"},
              {"name": "glass bottle", "location": "hand"}, {"name": "우산", "location": "unknown"}]}
-        self.assertEqual(normalize_analysis(raw)["objects"], ["병(손)", "휴대폰(손)", "페트병(바닥)"])
+        # Locations are not recorded; a floor location still drops furniture and shoes.
+        self.assertEqual(normalize_analysis(raw)["objects"], ["휴대폰", "페트병", "병", "우산"])
 
 
 class FilenameTests(unittest.TestCase):
@@ -54,9 +56,9 @@ class FilenameTests(unittest.TestCase):
         analysis = {"gender": "남성", "clothing": ["검정반팔", "파랑청바지"],
                     "objects": ["가방(손)", "캐리어(바닥)"]}
         self.assertEqual(filename_from_analysis(analysis, ".jpg"),
-                         "남성_검정반팔_파랑청바지_손-가방_바닥-캐리어.jpg")
+                         "남성_검정반팔_파랑청바지_가방_캐리어.jpg")
         analysis.update(clothing=["내가 쓴 옷"], objects=["의자(바닥)", "종이", "우산"])
-        self.assertEqual(filename_from_analysis(analysis, ".JPG"), "남성_내가쓴옷_바닥-의자_종이_우산.JPG")
+        self.assertEqual(filename_from_analysis(analysis, ".JPG"), "남성_내가쓴옷_의자_종이_우산.JPG")
 
     def test_manual_names_never_escape_folder_or_change_format(self):
         for name in ("../outside", r"..\outside", "C:outside", "AUX", "con.txt", "CON .txt", "CONIN$", "LPT¹", "...", "x ", "x.", "x\x00", "x.png"):
@@ -121,7 +123,7 @@ class ExistingFrameTagNameTests(unittest.TestCase):
 
     def test_documented_filename_and_legacy_collision_styles(self):
         expected = {"gender": "남성", "clothing": ["검정반팔", "파랑청바지"],
-                    "objects": ["가방(손)", "캐리어(바닥)"]}
+                    "objects": ["가방", "캐리어"]}
         for ending in (".jpg", "_2.JPG", "_16.jpeg", "_(2).png", " (2).webp"):
             name = "남성_검정반팔_파랑청바지_손-가방_바닥-캐리어" + ending
             with self.subTest(name=name):
@@ -144,12 +146,12 @@ class ExistingFrameTagNameTests(unittest.TestCase):
         name = "여성_노랑긴팔_파랑청바지_우산_상자_바닥-의자_바닥-종이.jpg"
         self.assertEqual(parse_frametag_filename(name), {
             "gender": "여성", "clothing": ["노랑긴팔", "파랑청바지"],
-            "objects": ["우산", "상자", "의자(바닥)", "종이(바닥)"],
+            "objects": ["우산", "상자", "의자", "종이"],
         })
 
     def test_explicit_objects_are_recognized_when_clothes_are_unavailable(self):
         self.assertEqual(parse_frametag_filename("남성_손-휴대폰_바닥-가방.jpg"), {
-            "gender": "남성", "clothing": [], "objects": ["휴대폰(손)", "가방(바닥)"],
+            "gender": "남성", "clothing": [], "objects": ["휴대폰", "가방"],
         })
 
     def test_exact_uncertain_and_no_person_output_without_clothes(self):
@@ -226,6 +228,36 @@ class ImageListTests(unittest.TestCase):
             self.assertEqual(len(list_images(root, recursive=True)), 5)
             self.assertLess(natural_key("pic2"), natural_key("pic10"))
 
+
+class ObjectLocationTests(unittest.TestCase):
+    def test_markers_are_removed_from_existing_names(self):
+        cases = {
+            "여성_노랑후드_파랑청바지_손-꽃.JPG": "여성_노랑후드_파랑청바지_꽃.JPG",
+            "남성_파랑반팔_베이지반바지_바닥-소화기_바닥-페트병_바닥-가방.jpg": "남성_파랑반팔_베이지반바지_소화기_페트병_가방.jpg",
+            # Collision numbers are dropped; the rename numbers the results afresh.
+            "남성_검정긴팔_파랑긴바지_손-컵라면_3.jpg": "남성_검정긴팔_파랑긴바지_컵라면.jpg",
+            "남성_검정반팔_손-가방_바닥-가방 (2).png": "남성_검정반팔_가방.png",
+            "남성_손-휴대폰.jpg": "남성_휴대폰.jpg",
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(strip_location_markers(name), expected)
+        for name in ("여성_교복_곰인형.jpg", "여성_흰색반팔_검정긴바지_3.jpg", "02160004.JPG", "손-꽃.jpg"):
+            with self.subTest(name=name):
+                self.assertIsNone(strip_location_markers(name) if name != "손-꽃.jpg" else None)
+        self.assertEqual(strip_location_markers("손-꽃.jpg"), "꽃.jpg")
+
+    def test_objects_lose_locations_and_duplicates(self):
+        analysis = {"gender": "여성", "clothing": ["노랑후드"], "objects": ["꽃(손)", "가방(바닥)", "가방(손)", "모자"]}
+        self.assertEqual(strip_objects(analysis)["objects"], ["꽃", "가방", "모자"])
+        self.assertIsNone(strip_objects({"objects": ["꽃", "모자"]}))
+        self.assertIsNone(strip_objects(None))
+
+    def test_ai_objects_without_location_include_worn_extras(self):
+        result = normalize_analysis({"gender": "여성", "clothing": [{"color": "검정", "type": "자켓"}],
+                                     "objects": ["모자", "목도리", "우산"]})
+        self.assertEqual(result["objects"], ["모자", "목도리", "우산"])
+        self.assertEqual(filename_from_analysis(result, ".jpg"), "여성_검정자켓_모자_목도리_우산.jpg")
 
 if __name__ == "__main__":
     unittest.main()
