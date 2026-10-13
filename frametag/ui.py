@@ -9,7 +9,7 @@ import queue
 import re
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
@@ -177,8 +177,33 @@ class FrameTagApp(tk.Tk):
             self.progress.configure(mode="determinate")
             self.progress["value"] = 100 * sum(bool(p.analysis) for p in self.photos) / len(self.photos) if self.photos else 0
 
+    # Segoe UI has no Hangul, so Windows drew Korean labels in a substitute
+    # font. Malgun Gothic covers Korean and Latin text in one typeface.
+    UI_FONTS = ("Malgun Gothic", "맑은 고딕", "Apple SD Gothic Neo", "Noto Sans CJK KR",
+                "Noto Sans KR", "NanumGothic")
+    NAMED_FONTS = ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont",
+                   "TkSmallCaptionFont", "TkIconFont", "TkTooltipFont")
+
+    def _ui_font_family(self):
+        available = set(tkfont.families(self))
+        for family in self.UI_FONTS:
+            if family in available:
+                return family
+        return tkfont.nametofont("TkDefaultFont", root=self).actual("family")
+
+    def _apply_fonts(self):
+        family = self._ui_font_family()
+        for name in self.NAMED_FONTS:
+            tkfont.nametofont(name, root=self).configure(
+                family=family, size=10, weight="bold" if name == "TkHeadingFont" else "normal",
+                slant="roman")
+        self.title_font = tkfont.Font(self, family=family, size=12, weight="bold")
+        self.option_add("*Font", "TkDefaultFont")
+        self.option_add("*TCombobox*Listbox.font", "TkDefaultFont")
+        return family
+
     def _apply_style(self):
-        self.option_add("*Font", ("Segoe UI", 10))
+        self.ui_font_family = self._apply_fonts()
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TFrame", background="#edf5ef")
@@ -190,8 +215,11 @@ class FrameTagApp(tk.Tk):
         style.map("TButton", background=[("active", "#d4e8da")])
         style.configure("Accent.TButton", background="#2f6c51", foreground="white")
         style.map("Accent.TButton", background=[("active", "#25583f")])
-        style.configure("Treeview", background="white", fieldbackground="white", rowheight=28)
-        style.configure("Treeview.Heading", background="#e2eee5", foreground="#254739", padding=8)
+        style.configure(".", font="TkDefaultFont")
+        style.configure("Treeview", background="white", fieldbackground="white", rowheight=28,
+                        font="TkDefaultFont")
+        style.configure("Treeview.Heading", background="#e2eee5", foreground="#254739", padding=8,
+                        font="TkHeadingFont")
         style.map("Treeview", background=[("selected", "#b9d9c5")], foreground=[("selected", "#153526")])
 
     def _build(self):
@@ -292,7 +320,7 @@ class FrameTagApp(tk.Tk):
         self.pane.add(preview, weight=2)
         preview_top = ttk.Frame(preview)
         preview_top.pack(fill="x", pady=(0, 8))
-        ttk.Label(preview_top, text="미리보기", font=("Segoe UI", 12, "bold")).pack(side="left")
+        ttk.Label(preview_top, text="미리보기", font=self.title_font).pack(side="left")
         ttk.Label(preview_top, textvariable=self.zoom_label).pack(side="right", padx=5)
         for text, command in (("+", lambda: self._zoom_by(1.25)),
                               ("맞춤", self._fit), ("−", lambda: self._zoom_by(0.8))):
@@ -555,7 +583,7 @@ class FrameTagApp(tk.Tk):
         dialog.geometry("850x540")
         frame = ttk.Frame(dialog, padding=10)
         frame.pack(fill="both", expand=True)
-        text = tk.Text(frame, wrap="word", font=("Segoe UI", 10))
+        text = tk.Text(frame, wrap="word", font="TkTextFont")
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
@@ -658,7 +686,7 @@ class FrameTagApp(tk.Tk):
         self._configure_engine()
         self._auto_pending = True
         self._update_buttons()
-        self._dispatch_engine(self.engine.set_auto, enabled, done="auto_done")
+        self._dispatch_engine(lambda: self.engine.set_auto(enabled, retry_failed=True), done="auto_done")
         self._save_settings()
 
     def _stop_analysis(self):

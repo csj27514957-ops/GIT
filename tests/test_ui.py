@@ -887,5 +887,20 @@ class UITests(unittest.TestCase):
         self.assertFalse(self.app.engine._worker.is_alive())
 
 
+    def test_interface_uses_one_font_family(self):
+        from tkinter import font as tkfont, ttk
+        family = self.app.ui_font_family
+        families = {tkfont.nametofont(name, root=self.app).actual("family")
+                    for name in self.app.NAMED_FONTS}
+        self.assertEqual(families, {tkfont.Font(self.app, family=family).actual("family")})
+        self.assertEqual(self.app.title_font.actual("family"), families.pop())
+        style = ttk.Style(self.app)
+        self.assertEqual(style.lookup("Treeview", "font"), "TkDefaultFont")
+        self.assertEqual(style.lookup("Treeview.Heading", "font"), "TkHeadingFont")
+        import tkinter as tk
+        label = tk.Label(self.app, text="미리보기")
+        self.assertEqual(str(label.cget("font")), "TkDefaultFont")
+        label.destroy()
+
 if __name__ == "__main__":
     unittest.main()

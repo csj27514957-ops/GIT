@@ -358,6 +358,25 @@ def unify_runs(photos: list[Photo]) -> list[Photo]:
     return changed
 
 
+RENAMED, ANALYSED, FAILED, ANALYSING, WAITING = range(5)
+
+
+def status_rank(photo: Photo) -> int:
+    """List order: finished, then failed, then the current request, then waiting.
+
+    Failed photos sit ahead of waiting ones, so a retry resumes where it stopped.
+    """
+    if photo.confirmed or is_gender_prefixed_filename(photo.path.name):
+        return RENAMED
+    if photo.status == "분석 중":
+        return ANALYSING
+    if photo.error or photo.status in ("오류", "파일명 오류"):
+        return FAILED
+    if photo.analysis and photo.proposed_name:
+        return ANALYSED
+    return WAITING
+
+
 def select_through(photos: list[Photo], current: Photo) -> list[Photo]:
     """Select eligible unconfirmed rows through the current object."""
     if current.confirmed or is_gender_prefixed_filename(current.path.name):

@@ -19,7 +19,7 @@ from PIL import Image
 from .api import APIError, Analyzer, Cancelled
 from .domain import (filename_from_analysis, is_gender_prefixed_filename, list_images, natural_key,
                      normalize_analysis, parse_frametag_filename,
-                     sanitize_filename, select_through, unify_runs)
+                     sanitize_filename, select_through, status_rank, unify_runs)
 from .models import Photo
 from .rename import apply_names, recover_pending, recovery_pending, undo_last
 from .storage import Cache, atomic_json
@@ -62,8 +62,7 @@ class Engine:
 
     def _ordered(self) -> list[Photo]:
         return sorted(self._photos.values(), key=lambda p: (
-            not (p.confirmed or is_gender_prefixed_filename(p.path.name)),
-            natural_key(str(p.path.parent)), natural_key(p.path.name)))
+            status_rank(p), natural_key(str(p.path.parent)), natural_key(p.path.name)))
 
     def get_photos(self) -> list[Photo]:
         with self._lock:
@@ -193,9 +192,28 @@ class Engine:
                     self._save_manifest()
         self._wake.set()
 
-    def set_auto(self, enabled: bool) -> None:
+    def _requeue_failures(self) -> None:
+        """A restart retries failed photos first instead of leaving them parked."""
+        changed = False
+        for record in self._known.values():
+            if record.get("state") == "error":
+                record["state"] = "pending"
+                changed = True
+        if changed:
+            self._save_manifest()
+        self._consecutive_failures = 0
+        self._rename_failures = 0
+
+    def set_auto(self, enabled: bool, retry_failed: bool = False) -> None:
+        """retry_failed: the user switched this on, so failed photos go first.
+
+        Resuming saved settings at startup leaves failures parked, so a fatal
+        error such as a rejected key is not resent on every launch.
+        """
         with self._lock:
             enabled = bool(enabled) and not self._closed
+            if enabled and retry_failed:
+                self._requeue_failures()
             if enabled == self._auto:
                 return
             self._auto = enabled
@@ -215,6 +233,7 @@ class Engine:
             if not all(self._config):
                 self._emit("error", "API 공급자, 모델과 API 키를 설정하세요.")
                 return
+            self._requeue_failures()
             self._cancel = threading.Event()
             self._busy, self._operation, self._manual_requested = True, "manual", True
             self._emit("busy", True)
@@ -485,11 +504,22 @@ class Engine:
 
     def _run_manual(self) -> None:
         with self._lock:
-            identifiers = [str(p.path) for p in self._ordered() if self._needs_analysis(p)]
+            # Failed photos sort ahead of waiting ones. With automatic renaming on,
+            # a photo whose rename failed is retried too, reusing its analysis.
+            work = [(str(p.path), self._auto and p.status == "파일명 오류") for p in self._ordered()
+                    if self._needs_analysis(p) or (self._auto and p.status == "파일명 오류"
+                                                   and not p.confirmed and not p.manual)]
         halted = False
-        for identifier in identifiers:
+        for identifier, rename_retry in work:
             if self._cancel.is_set() or self._closed:
                 break
+            if rename_retry:
+                if not self._auto:
+                    continue  # Automatic renaming was switched off during this run.
+                result = self._process(identifier, automatic=True)
+                if result == "rename_error" and recovery_pending(self._root):
+                    break
+                continue
             result = self._process(identifier, automatic=False)
             if result == "reconfigured" and not self._cancel.is_set() and not self._closed:
                 # Retry this photo once; repeated settings edits must not keep

@@ -822,11 +822,11 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(calls, [("first.png", "first-key-placeholder"),
                                  ("first.png", "second-key-placeholder"),
                                  ("second.png", "third-key-placeholder")])
-        photos = engine.get_photos()
-        self.assertEqual(photos[0].status, "대기")
-        self.assertIsNone(photos[0].analysis)
+        photos = {photo.path.name: photo for photo in engine.get_photos()}
+        self.assertEqual(photos["first.png"].status, "대기")
+        self.assertIsNone(photos["first.png"].analysis)
         self.assertEqual(engine._known["first.png"]["state"], "pending")
-        self.assertTrue(photos[1].analysis)
+        self.assertTrue(photos["second.png"].analysis)
         self.assertEqual(engine._consecutive_failures, 0)
         self.assertFalse(any(kind == "error" for kind, _value in self.events))
 
@@ -1159,6 +1159,75 @@ class EngineTests(unittest.TestCase):
             time.sleep(0.3)
         self.assertEqual(len(self.api.calls), 3)
         self.assertEqual(len(list(self.root.glob("*.png"))), 5)
+
+    def failing_factory(self, failing, fatal=True):
+        """Fails only the named photos; records every call in self.api.calls."""
+        def factory(provider, model, key):
+            outer = self
+
+            class Analyzer:
+                def analyze(self, path, cancel):
+                    outer.api.calls.append((path.name, provider, model))
+                    if path.name in failing:
+                        raise APIError("일시적인 서버 오류", fatal=fatal)
+                    return RESULT
+
+            return Analyzer()
+        return factory
+
+    def test_list_is_ordered_finished_then_failed_then_waiting(self):
+        failing = set()
+        self.photo(TAGGED_NAME)
+        self.photo("m.png")
+        engine = self.engine(analyzer_factory=self.failing_factory(failing))
+        engine.start_analysis()
+        self.idle(engine)
+        failing.add("y.png")
+        self.photo("y.png", color="blue")
+        wait_until(lambda: len(engine.get_photos()) == 3)
+        engine.start_analysis()
+        self.idle(engine)
+        self.photo("b.png", color="green")
+        wait_until(lambda: len(engine.get_photos()) == 4)
+        self.assertEqual([(photo.path.name, photo.status) for photo in engine.get_photos()],
+                         [(TAGGED_NAME, "기존 이름 변경 완료"), ("m.png", "분석 완료"),
+                          ("y.png", "오류"), ("b.png", "대기")])
+        failing.clear()
+        before = len(self.api.calls)
+        engine.start_analysis()
+        self.idle(engine)
+        # The failed photo is retried before the photo that was only waiting.
+        self.assertEqual([name for name, *_ in self.api.calls[before:]], ["y.png", "b.png"])
+
+    def test_turning_auto_on_retries_failed_photos_before_waiting_ones(self):
+        failing = {"y.png"}
+        engine = self.engine(analyzer_factory=self.failing_factory(failing, fatal=False))
+        engine.set_auto(True, retry_failed=True)
+        self.photo("y.png")
+        wait_until(lambda: engine.get_photos() and engine.get_photos()[0].status == "오류")
+        engine.set_auto(False)
+        self.idle(engine)
+        self.photo("b.png", color="blue")
+        wait_until(lambda: len(engine.get_photos()) == 2)
+        time.sleep(0.2)
+        failing.clear()
+        before = len(self.api.calls)
+        engine.set_auto(True, retry_failed=True)
+        wait_until(lambda: all(photo.confirmed for photo in engine.get_photos()))
+        self.assertEqual([name for name, *_ in self.api.calls[before:]], ["y.png", "b.png"])
+
+    def test_restart_with_auto_on_retries_a_failed_rename_without_new_analysis(self):
+        engine = self.engine()
+        engine.set_auto(True, retry_failed=True)
+        with patch("frametag.engine.apply_names", side_effect=PermissionError("locked")):
+            self.photo("new.png")
+            wait_until(lambda: engine.get_photos() and engine.get_photos()[0].status == "파일명 오류")
+            self.idle(engine)
+        engine.start_analysis()
+        wait_until(lambda: engine.get_photos()[0].confirmed)
+        self.idle(engine)
+        self.assertEqual(len(self.api.calls), 1)
+        self.assertFalse((self.root / "new.png").exists())
 
 if __name__ == "__main__":
     unittest.main()
